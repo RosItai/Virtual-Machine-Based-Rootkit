@@ -21,50 +21,9 @@
 #include "memory.h"
 #include "string.h"
 #include "debug.h"
-#include "vmcs_fields.h"
+#include "vmcs.h"
+#include "vmexit.h"
 #include "ept.h"
-
-#define IA32_FEATURE_CONTROL_MSR 0x3Au
-#define FEATURE_CONTROL_LOCKED             (1ull << 0)
-#define FEATURE_CONTROL_VMX_OUTSIDE_SMX    (1ull << 2)
-
-#define IA32_VMX_BASIC_MSR 0x480u
-#define IA32_VMX_PINBASED_CTLS_MSR      0x481u
-#define IA32_VMX_PROCBASED_CTLS_MSR     0x482u
-#define IA32_VMX_EXIT_CTLS_MSR          0x483u
-#define IA32_VMX_ENTRY_CTLS_MSR         0x484u
-#define IA32_VMX_CR0_FIXED0_MSR 0x486u
-#define IA32_VMX_CR0_FIXED1_MSR 0x487u
-#define IA32_VMX_CR4_FIXED0_MSR 0x488u
-#define IA32_VMX_CR4_FIXED1_MSR 0x489u
-#define IA32_VMX_TRUE_PINBASED_CTLS_MSR  0x48Du
-#define IA32_VMX_TRUE_PROCBASED_CTLS_MSR 0x48Eu
-#define IA32_VMX_TRUE_EXIT_CTLS_MSR      0x48Fu
-#define IA32_VMX_TRUE_ENTRY_CTLS_MSR     0x490u
-#define IA32_VMX_PROCBASED_CTLS2_MSR     0x48Bu /* secondary controls - no "true" variant exists */
-
-#define ACTIVATE_SECONDARY_CONTROLS (1u << 31)
-#define SECONDARY_ENABLE_EPT        (1u << 1)
-/* Lets the guest run with CR0.PE=0 or CR0.PG=0 (real mode, or
- * protected mode without paging) - exempts those two bits from the
- * CR0 FIXED0 check. VM-entry requires ENABLE_EPT alongside it, since
- * an unpaged guest's "physical" addresses must still be translated. */
-#define SECONDARY_UNRESTRICTED_GUEST (1u << 7)
-
-#define IA32_EFER_MSR    0xC0000080u
-#define IA32_FS_BASE_MSR 0xC0000100u
-#define IA32_GS_BASE_MSR 0xC0000101u
-
-#define CR4_VMXE (1ull << 13)
-
-#define VM_EXIT_HOST_ADDR_SPACE_SIZE (1u << 9)
-/* Load GUEST_IA32_EFER on entry. Without it the guest would keep the
- * host's EFER.LME=1 - harmless for a real-mode guest that never turns
- * paging on, but not the clean reset state a real guest OS expects. */
-#define VM_ENTRY_LOAD_IA32_EFER      (1u << 15)
-
-#define CR0_PE (1ull << 0)
-#define CR0_PG (1ull << 31)
 
 /* CPUID.1:ECX.VMX[bit 5] */
 static int checkForVmxSupport(void) {
@@ -120,9 +79,9 @@ static void prepareVmxRegion(void *region) {
     *(uint32_t *)region = revisionId;
 }
 
-/* VMXON/VMCLEAR/VMPTRLD all report success/failure the same way: CF=1
- * (VMfailInvalid) or ZF=1 (VMfailValid) means failure, both clear
- * means success - SETNA (set-if-CF-or-ZF) reads exactly that in one
+/* VMXON/VMCLEAR/VMPTRLD all report success/failure the same way (see
+ * CARRY_FLAG_MASK/ZERO_FLAG_MASK in vmcs.h) - SETNA (set-if-CF-or-ZF)
+ * reads exactly that in one
  * instruction. Each wrapper is a single asm block so nothing can
  * clobber the flags between the instruction and reading them. All
  * take a *physical* address (see the file-level comment). */
@@ -165,7 +124,7 @@ static int vmptrld(uint64_t physAddr) {
  *   VMREAD  value_rm, field_reg   ->  AT&T: vmread  field, value
  * Getting this backwards silently writes/reads the wrong VMCS field
  * with no compile-time or assemble-time signal that anything's wrong. */
-static void vmwrite(uint64_t field, uint64_t value) {
+void vmwrite(uint64_t field, uint64_t value) {
     uint8_t fail;
     __asm__ volatile("vmwrite %2, %1\n\t"
                       "setna %0"
@@ -177,7 +136,7 @@ static void vmwrite(uint64_t field, uint64_t value) {
     }
 }
 
-static uint64_t vmread(uint64_t field) {
+uint64_t vmread(uint64_t field) {
     uint64_t value;
     __asm__ volatile("vmread %1, %0"
                       : "=r"(value)
@@ -234,24 +193,8 @@ static void setupTss(void) {
     loadTR(GDT_TSS_SEL);
 }
 
-/* ===================================================================
- * Guest/host segment access-rights bits - the VMCS's own 32-bit AR
- * format, NOT the same bit positions as a raw GDT descriptor byte
- * (see src/boot/macros.asm for that unrelated set). Bits 0-7 match a
- * standard descriptor access byte; bits 12-15 match a standard flags
- * nibble, just shifted to sit directly in this one field instead of
- * split across descriptor bytes; bit 16 is VMX-specific (Unusable).
- * =================================================================== */
-#define SEG_A          (1u << 0)   /* Accessed */
-#define SEG_RW         (1u << 1)   /* Readable(code) / Writable(data) */
-#define SEG_DC         (1u << 2)   /* Direction/Conforming */
-#define SEG_E          (1u << 3)   /* Executable */
-#define SEG_S          (1u << 4)   /* Descriptor type: 1=code/data, 0=system */
-#define SEG_P          (1u << 7)   /* Present */
-#define SEG_LONG_FLAG  (1u << 13)  /* L - 64-bit code segment */
-#define SEG_SIZE_FLAG  (1u << 14)  /* D/B */
-#define SEG_FLAG_G     (1u << 15)  /* Granularity */
-#define SEG_UNUSABLE   (1u << 16)  /* VMX-specific: segment not in use */
+/* Segment access-rights bits are in vmcs.h - the exit handler needs
+ * them too, to tell a 64-bit guest from a 32-bit one. */
 
 /* Clears a selector's RPL (bits 0-1) and TI (bit 2) - the guest/host
  * start on the same flat, ring-0, GDT-based selectors the kernel
@@ -286,55 +229,6 @@ static void copyRealModeGuest(void) {
     logInfo("Real-mode guest copied to %lx (%lu bytes)\n", REAL_MODE_GUEST_ADDRESS, size);
 }
 
-/* Placeholder VM-exit handler - every exit lands here since nothing
- * populates a real per-reason dispatch or resumes the guest yet.
- * Logs the exit reason/qualification and halts. */
-static void VmExitHandler(void) {
-    uint64_t reason = vmread(VM_EXIT_REASON);
-    uint64_t qualification = vmread(EXIT_QUALIFICATION);
-    logError("VMEXIT reason=%lx qualification=%lx\n", reason, qualification);
-
-    /* Temporary: reason 0x80000021 (invalid guest state) gives almost
-     * no detail from qualification alone - read back what actually
-     * ended up in the fields most commonly responsible, to check for
-     * a mismatch against what initializeGuestState intended. */
-    logInfo("CR0=%lx CR4=%lx RFLAGS=%lx EFER=%lx\n",
-            vmread(GUEST_CR0), vmread(GUEST_CR4), vmread(GUEST_RFLAGS), vmread(GUEST_IA32_EFER));
-    logInfo("CS sel=%lx ar=%lx  SS sel=%lx ar=%lx\n",
-            vmread(GUEST_CS_SELECTOR), vmread(GUEST_CS_AR_BYTES),
-            vmread(GUEST_SS_SELECTOR), vmread(GUEST_SS_AR_BYTES));
-    logInfo("DS sel=%lx ar=%lx  ES sel=%lx ar=%lx\n",
-            vmread(GUEST_DS_SELECTOR), vmread(GUEST_DS_AR_BYTES),
-            vmread(GUEST_ES_SELECTOR), vmread(GUEST_ES_AR_BYTES));
-    logInfo("FS sel=%lx ar=%lx  GS sel=%lx ar=%lx\n",
-            vmread(GUEST_FS_SELECTOR), vmread(GUEST_FS_AR_BYTES),
-            vmread(GUEST_GS_SELECTOR), vmread(GUEST_GS_AR_BYTES));
-    logInfo("TR sel=%lx ar=%lx  LDTR sel=%lx ar=%lx\n",
-            vmread(GUEST_TR_SELECTOR), vmread(GUEST_TR_AR_BYTES),
-            vmread(GUEST_LDTR_SELECTOR), vmread(GUEST_LDTR_AR_BYTES));
-    logInfo("RIP=%lx RSP=%lx\n", vmread(GUEST_RIP), vmread(GUEST_RSP));
-    logInfo("CR3=%lx DR7=%lx\n", vmread(GUEST_CR3), vmread(GUEST_DR7));
-    logInfo("GDTR base=%lx limit=%lx  IDTR base=%lx limit=%lx\n",
-            vmread(GUEST_GDTR_BASE), vmread(GUEST_GDTR_LIMIT),
-            vmread(GUEST_IDTR_BASE), vmread(GUEST_IDTR_LIMIT));
-    logInfo("CS/SS/DS/ES base=%lx/%lx/%lx/%lx limit=%lx/%lx/%lx/%lx\n",
-            vmread(GUEST_CS_BASE), vmread(GUEST_SS_BASE), vmread(GUEST_DS_BASE), vmread(GUEST_ES_BASE),
-            vmread(GUEST_CS_LIMIT), vmread(GUEST_SS_LIMIT), vmread(GUEST_DS_LIMIT), vmread(GUEST_ES_LIMIT));
-    logInfo("activity=%lx interruptibility=%lx pending_dbg=%lx\n",
-            vmread(GUEST_ACTIVITY_STATE), vmread(GUEST_INTERRUPTIBILITY_INFO), vmread(GUEST_PENDING_DBG_EXCEPTIONS));
-    logInfo("sysenter cs=%lx esp=%lx eip=%lx  link_ptr=%lx\n",
-            vmread(GUEST_SYSENTER_CS), vmread(GUEST_SYSENTER_ESP), vmread(GUEST_SYSENTER_EIP),
-            vmread(VMCS_LINK_POINTER));
-    logInfo("pin=%lx primaryProc=%lx exit=%lx entry=%lx\n",
-            vmread(PIN_BASED_VM_EXEC_CONTROL), vmread(CPU_BASED_VM_EXEC_CONTROL),
-            vmread(VM_EXIT_CONTROLS), vmread(VM_ENTRY_CONTROLS));
-
-    for (;;) {
-        __asm__ volatile("cli\n\t"
-                          "hlt");
-    }
-}
-
 /* Real mode: a segment's base is always selector * 16. */
 static void writeRealModeSegment(uint64_t selectorField, uint64_t baseField, uint64_t limitField,
                                  uint64_t accessRightsField, uint16_t selector, uint32_t accessRights) {
@@ -345,15 +239,29 @@ static void writeRealModeSegment(uint64_t selectorField, uint64_t baseField, uin
 }
 
 static void initializeGuestState(void) {
-    /* PE=0, PG=0 - real mode. Unrestricted guest exempts exactly these
-     * two bits from the CR0 FIXED0 check; the rest (e.g. NE) still has
-     * to satisfy it, hence starting from the host's already-fixed CR0. */
-    vmwrite(GUEST_CR0, readCr0() & ~(CR0_PE | CR0_PG));
+    /* Ask for nothing at all in CR0/CR4 and let writeGuestCr0/Cr4 add
+     * back whatever VMX insists on: PE=0 and PG=0 (real mode, which
+     * only unrestricted guest permits), and no PAE/PSE.
+     *
+     * Deliberately NOT derived from the host's own CR0/CR4 any more.
+     * The host runs with PAE on and paging enabled; handing those to a
+     * guest OS that is about to build its own page tables and turn
+     * paging on itself means it enables PG with a PAE setting it never
+     * chose - and a 32-bit bootloader expecting plain two-level paging
+     * then walks tables in the wrong format. A guest's control
+     * registers should start where a CPU out of reset leaves them,
+     * not where the host happens to be.
+     *
+     * EFER goes first because writeGuestCr0 reconciles CR0.PG against
+     * it, and reading a VMCS field that was never written isn't
+     * architecturally defined. LME=0, LMA=0: loaded on entry because
+     * of VM_ENTRY_LOAD_IA32_EFER, and LMA must agree with the
+     * IA32e-mode-guest entry control, which starts clear. */
+    vmwrite(GUEST_IA32_EFER, 0);
+    writeGuestCr0(CR0_ET); /* ET is set on every CPU since the 486 */
+    writeGuestCr4(0);
     /* Unused with paging off, but must still be a valid address. */
     vmwrite(GUEST_CR3, 0);
-    /* Unrestricted guest does NOT exempt CR4 from its FIXED0 check, so
-     * VMXE stays set. PAE is harmless with paging off. */
-    vmwrite(GUEST_CR4, readCr4());
     vmwrite(GUEST_DR7, readDr7());
     vmwrite(GUEST_RSP, REAL_MODE_STACK_POINTER);
     vmwrite(GUEST_RIP, 0); /* offset within CS - see REAL_MODE_GUEST_SEGMENT */
@@ -400,9 +308,6 @@ static void initializeGuestState(void) {
     vmwrite(GUEST_IDTR_LIMIT, 0x3FF);
 
     vmwrite(GUEST_IA32_DEBUGCTL, 0);
-    /* LME=0, LMA=0 - loaded because of VM_ENTRY_LOAD_IA32_EFER. LMA
-     * must match the IA32E_MODE_GUEST entry control, which is 0. */
-    vmwrite(GUEST_IA32_EFER, 0);
     vmwrite(GUEST_SYSENTER_CS, 0);
     vmwrite(GUEST_SYSENTER_ESP, 0);
     vmwrite(GUEST_SYSENTER_EIP, 0);
@@ -419,7 +324,10 @@ static void initializeHostState(void) {
     vmwrite(HOST_CR0, readCr0());
     vmwrite(HOST_CR3, readCr3());
     vmwrite(HOST_CR4, readCr4());
-    vmwrite(HOST_RIP, (uint64_t)VmExitHandler);
+    /* The asm stub, not the C handler: a VM exit leaves every GPR
+     * holding the guest's value, and compiled code would destroy them
+     * before anything could save them (see vmexit_entry.asm). */
+    vmwrite(HOST_RIP, (uint64_t)vmexit_entry);
 
     void *hostStack = allocateMemory(STACK_SIZE);
     vmwrite(HOST_RSP, (uint64_t)hostStack + STACK_SIZE); /* stack grows down - start at the top */
@@ -444,25 +352,101 @@ static void initializeHostState(void) {
     vmwrite(HOST_IA32_EFER, readMsr(IA32_EFER_MSR));
 }
 
+/* ===================================================================
+ * MSR bitmap - four 1KB bit arrays in one page: read-low, read-high,
+ * write-low, write-high. A set bit means "VM exit on this access"; a
+ * clear bit lets the guest reach the real MSR with no exit at all.
+ *
+ * Without a bitmap *every* RDMSR/WRMSR exits, and an OS does thousands
+ * of them before it finishes booting. So the page starts all-zero and
+ * only the handful of MSRs we actually have to lie about get marked -
+ * see handleRdmsr/handleWrmsr in vmexit.c.
+ * =================================================================== */
+#define MSR_BITMAP_READ_LOW   0u
+#define MSR_BITMAP_READ_HIGH  1024u
+#define MSR_BITMAP_WRITE_LOW  2048u
+#define MSR_BITMAP_WRITE_HIGH 3072u
+
+#define MSR_LOW_RANGE_END    0x2000u
+#define MSR_HIGH_RANGE_START 0xC0000000u
+#define MSR_HIGH_RANGE_END   0xC0002000u
+
+static void interceptMsr(uint8_t *bitmap, uint32_t msr) {
+    uint32_t index;
+    uint32_t readBase;
+    uint32_t writeBase;
+
+    if (msr < MSR_LOW_RANGE_END) {
+        index = msr;
+        readBase = MSR_BITMAP_READ_LOW;
+        writeBase = MSR_BITMAP_WRITE_LOW;
+    } else if (msr >= MSR_HIGH_RANGE_START && msr < MSR_HIGH_RANGE_END) {
+        index = msr - MSR_HIGH_RANGE_START;
+        readBase = MSR_BITMAP_READ_HIGH;
+        writeBase = MSR_BITMAP_WRITE_HIGH;
+    } else {
+        /* An MSR outside both ranges exits unconditionally whatever
+         * the bitmap says, so there's no bit to set. */
+        return;
+    }
+
+    bitmap[readBase + index / 8] |= (uint8_t)(1u << (index % 8));
+    bitmap[writeBase + index / 8] |= (uint8_t)(1u << (index % 8));
+}
+
+static int initializeMsrBitmap(void) {
+    uint8_t *bitmap = allocateMemory(PAGE_SIZE);
+    if (!bitmap) {
+        logError("couldn't allocate the MSR bitmap!!!\n");
+        return 0;
+    }
+    memset(bitmap, 0, PAGE_SIZE);
+
+    /* EFER: the guest's copy lives in the VMCS, and a write to it is
+     * how a guest announces it's about to enable long mode. */
+    interceptMsr(bitmap, IA32_EFER_MSR);
+    /* IA32_FEATURE_CONTROL: reported locked with VMX disabled, so the
+     * guest doesn't try to run VMX of its own. */
+    interceptMsr(bitmap, IA32_FEATURE_CONTROL_MSR);
+
+    vmwrite(MSR_BITMAP, (uint64_t)bitmap);
+    return 1;
+}
+
 static int initializeControls(uint64_t eptPointer) {
     int trueControls = usesTrueControls();
 
+    /* External-interrupt exiting stays off deliberately: device
+     * interrupts go straight to the guest, which is what we want for
+     * a guest that owns the hardware - and it means the host needs no
+     * IDT of its own. */
     uint32_t pinBased = adjustControls(0,
         trueControls ? IA32_VMX_TRUE_PINBASED_CTLS_MSR : IA32_VMX_PINBASED_CTLS_MSR);
     vmwrite(PIN_BASED_VM_EXEC_CONTROL, pinBased);
 
     /* adjustControls silently drops any requested bit the CPU doesn't
      * allow, so check the bits EPT depends on actually survived. */
-    uint32_t primaryProcBased = adjustControls(ACTIVATE_SECONDARY_CONTROLS,
+    uint32_t primaryProcBased = adjustControls(ACTIVATE_SECONDARY_CONTROLS | CPU_BASED_USE_MSR_BITMAPS,
         trueControls ? IA32_VMX_TRUE_PROCBASED_CTLS_MSR : IA32_VMX_PROCBASED_CTLS_MSR);
     if (!(primaryProcBased & ACTIVATE_SECONDARY_CONTROLS)) {
         logError("CPU doesn't allow secondary controls - can't enable EPT!!!\n");
         return 0;
     }
+    if (!(primaryProcBased & CPU_BASED_USE_MSR_BITMAPS)) {
+        /* Not fatal: without a bitmap every MSR access exits, which is
+         * slow but still correct, since the handler passes through
+         * everything it doesn't special-case. */
+        logError("CPU doesn't allow MSR bitmaps - every MSR access will exit\n");
+    }
     vmwrite(CPU_BASED_VM_EXEC_CONTROL, primaryProcBased);
 
-    uint32_t secondaryProcBased = adjustControls(SECONDARY_ENABLE_EPT | SECONDARY_UNRESTRICTED_GUEST,
-                                                 IA32_VMX_PROCBASED_CTLS2_MSR);
+    /* RDTSCP/INVPCID/XSAVES are requested because without their enable
+     * bits the guest gets #UD on instructions a modern OS simply uses -
+     * a failure that looks nothing like a missing control bit. */
+    uint32_t secondaryProcBased = adjustControls(
+        SECONDARY_ENABLE_EPT | SECONDARY_UNRESTRICTED_GUEST |
+        SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_INVPCID | SECONDARY_ENABLE_XSAVES,
+        IA32_VMX_PROCBASED_CTLS2_MSR);
     if (!(secondaryProcBased & SECONDARY_ENABLE_EPT)) {
         logError("CPU doesn't allow EPT!!!\n");
         return 0;
@@ -471,16 +455,39 @@ static int initializeControls(uint64_t eptPointer) {
         logError("CPU doesn't allow unrestricted guest!!!\n");
         return 0;
     }
+    if (!(secondaryProcBased & SECONDARY_ENABLE_RDTSCP)) {
+        logError("CPU doesn't allow RDTSCP in the guest - it will #UD there\n");
+    }
+    if (!(secondaryProcBased & SECONDARY_ENABLE_INVPCID)) {
+        logError("CPU doesn't allow INVPCID in the guest - it will #UD there\n");
+    }
+    if (!(secondaryProcBased & SECONDARY_ENABLE_XSAVES)) {
+        logError("CPU doesn't allow XSAVES in the guest - it will #UD there\n");
+    }
     vmwrite(SECONDARY_VM_EXEC_CONTROL, secondaryProcBased);
     vmwrite(EPT_POINTER, eptPointer);
 
+    if (!initializeMsrBitmap()) {
+        return 0;
+    }
+
     /* HOST_ADDR_SPACE_SIZE is required: the host is running in 64-bit
-     * mode, so VM-exit must return to 64-bit mode too. */
-    uint32_t exitControls = adjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE,
+     * mode, so VM-exit must return to 64-bit mode too. The two EFER
+     * controls are what make the guest's EFER readable on exit (see
+     * vmcs.h) - without the save side, the exit handler has no way to
+     * find out whether the guest has set LME. */
+    uint32_t exitControls = adjustControls(
+        VM_EXIT_HOST_ADDR_SPACE_SIZE | VM_EXIT_SAVE_IA32_EFER | VM_EXIT_LOAD_IA32_EFER,
         trueControls ? IA32_VMX_TRUE_EXIT_CTLS_MSR : IA32_VMX_EXIT_CTLS_MSR);
+    if (!(exitControls & VM_EXIT_SAVE_IA32_EFER)) {
+        logError("CPU doesn't allow saving the guest's EFER on VM-exit!!!\n");
+        return 0;
+    }
     vmwrite(VM_EXIT_CONTROLS, exitControls);
 
-    /* No IA32E_MODE_GUEST - the guest starts in real mode. */
+    /* IA32E_MODE_GUEST is deliberately not requested here - the guest
+     * starts in real mode, and from then on it's maintained by
+     * syncLongModeEntryControl (vmexit.c) as the guest switches modes. */
     uint32_t entryControls = adjustControls(VM_ENTRY_LOAD_IA32_EFER,
         trueControls ? IA32_VMX_TRUE_ENTRY_CTLS_MSR : IA32_VMX_ENTRY_CTLS_MSR);
     if (!(entryControls & VM_ENTRY_LOAD_IA32_EFER)) {
@@ -488,6 +495,21 @@ static int initializeControls(uint64_t eptPointer) {
         return 0;
     }
     vmwrite(VM_ENTRY_CONTROLS, entryControls);
+
+    /* Which CR0/CR4 bits the host owns, i.e. which guest writes exit:
+     *   CR0.PG  - the only way to learn the guest is enabling paging,
+     *             and therefore possibly long mode
+     *   CR0.PE  - the real-mode -> protected-mode switch, so the whole
+     *             sequence funnels through one handler
+     *   CR0.NE  - required to be 1 by IA32_VMX_CR0_FIXED0; owning it
+     *             means a guest write can't leave GUEST_CR0 in a state
+     *             that fails the *next* VM entry
+     *   CR4.VMXE - forced on in GUEST_CR4, so it has to be owned (and
+     *             hidden by the read shadow) rather than visible
+     * Everything else is the guest's, written through with no exit. */
+    vmwrite(CR0_GUEST_HOST_MASK, CR0_PE | CR0_PG | CR0_NE);
+    vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE);
+    vmwrite(CR3_TARGET_COUNT, 0);
 
     vmwrite(EXCEPTION_BITMAP, 0); /* don't intercept any exceptions yet */
     vmwrite(VM_EXIT_MSR_STORE_COUNT, 0);
@@ -497,19 +519,20 @@ static int initializeControls(uint64_t eptPointer) {
     return 1;
 }
 
+/* Controls go in before guest state, not after: the guest's CR0 now
+ * goes through writeGuestCr0, which reconciles the IA32e-mode-guest
+ * entry control against it, so VM_ENTRY_CONTROLS has to hold a real
+ * value by then. */
 static int initializeVmcs(uint64_t eptPointer) {
     setupTss();
-    initializeGuestState();
-    initializeHostState();
     if (!initializeControls(eptPointer)) {
         return 0;
     }
+    initializeGuestState();
+    initializeHostState();
     logInfo("VMCS fields initialized, EPT and unrestricted guest enabled\n");
     return 1;
 }
-
-#define CARRY_FLAG_MASK (1ull << 0)
-#define ZERO_FLAG_MASK  (1ull << 6)
 
 /* On success, vmlaunch transfers control straight to the guest
  * (the real-mode code at REAL_MODE_GUEST_ADDRESS) and never returns
@@ -528,8 +551,10 @@ static void vmlaunch(void) {
                       : "=r"(rflags));
     if (rflags & CARRY_FLAG_MASK) {
         logError("vmlaunch failed: VMfailInvalid\n");
+        dumpVmcsState();
     } else if (rflags & ZERO_FLAG_MASK) {
         logError("vmlaunch failed: VMfailValid, error code %lu\n", vmread(VM_INSTRUCTION_ERROR));
+        dumpVmcsState();
     }
 }
 
@@ -583,6 +608,16 @@ void InitializeVmm(void) {
     logSection("VMCS");
     if (!initializeVmcs(eptPointer)) {
         return;
+    }
+
+    /* Everything the VMM owns has been allocated by now, so this is
+     * the first point the span is final - and it's exactly what the
+     * guest's E820 map will have to declare reserved. */
+    uint64_t reservedBase;
+    uint64_t reservedEnd;
+    if (getVmmReservedRange(&reservedBase, &reservedEnd)) {
+        logInfo("VMM memory to protect: %lx-%lx (%lu KB)\n",
+                reservedBase, reservedEnd, (reservedEnd - reservedBase) / 1024);
     }
 
     logSection("Guest");

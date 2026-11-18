@@ -25,7 +25,13 @@
 #define HOST_TR_SELECTOR 0x0C0Cu
 
 /* --- 64-bit control fields --- */
+#define MSR_BITMAP  0x2004u
 #define EPT_POINTER 0x201Au
+
+/* --- 64-bit read-only data field ---
+ * The guest-physical address an EPT violation/misconfiguration
+ * happened on - the only field that reports it. */
+#define GUEST_PHYSICAL_ADDRESS 0x2400u
 
 /* --- 64-bit fields --- */
 #define VMCS_LINK_POINTER   0x2800u
@@ -40,6 +46,7 @@
 #define PIN_BASED_VM_EXEC_CONTROL     0x4000u
 #define CPU_BASED_VM_EXEC_CONTROL     0x4002u /* "primary" processor-based controls */
 #define EXCEPTION_BITMAP              0x4004u
+#define CR3_TARGET_COUNT              0x400Au
 #define VM_EXIT_CONTROLS              0x400Cu
 #define VM_EXIT_MSR_STORE_COUNT       0x400Eu
 #define VM_EXIT_MSR_LOAD_COUNT        0x4010u
@@ -51,10 +58,16 @@
 #define SECONDARY_VM_EXEC_CONTROL     0x401Eu
 
 /* --- 32-bit read-only data fields --- */
-#define VM_INSTRUCTION_ERROR 0x4400u
-#define VM_EXIT_REASON       0x4402u
-#define VM_EXIT_INTR_INFO    0x4404u
-#define VM_EXIT_INSTRUCTION_LEN 0x440Cu
+#define VM_INSTRUCTION_ERROR      0x4400u
+#define VM_EXIT_REASON            0x4402u
+#define VM_EXIT_INTR_INFO         0x4404u
+#define VM_EXIT_INTR_ERROR_CODE   0x4406u
+/* An event that was being delivered through the guest's IDT when the
+ * exit happened - it has to be re-injected, or it's simply lost. */
+#define IDT_VECTORING_INFO_FIELD  0x4408u
+#define IDT_VECTORING_ERROR_CODE  0x440Au
+#define VM_EXIT_INSTRUCTION_LEN   0x440Cu
+#define VMX_INSTRUCTION_INFO      0x440Eu
 
 /* --- 32-bit guest-state fields --- */
 #define GUEST_ES_LIMIT   0x4800u
@@ -82,8 +95,19 @@
 /* --- 32-bit host-state field --- */
 #define HOST_IA32_SYSENTER_CS 0x4C00u
 
-/* --- Natural-width control/read-only fields --- */
-#define EXIT_QUALIFICATION 0x6400u
+/* --- Natural-width control fields ---
+ * A guest/host mask bit of 1 means the host owns that CR bit: the
+ * guest's reads of it are answered from the read shadow, and a guest
+ * write that would change it causes a VM exit instead. A 0 bit belongs
+ * to the guest outright - written straight through, no exit. */
+#define CR0_GUEST_HOST_MASK 0x6000u
+#define CR4_GUEST_HOST_MASK 0x6002u
+#define CR0_READ_SHADOW     0x6004u
+#define CR4_READ_SHADOW     0x6006u
+
+/* --- Natural-width read-only fields --- */
+#define EXIT_QUALIFICATION   0x6400u
+#define GUEST_LINEAR_ADDRESS 0x640Au
 
 /* --- Natural-width guest-state fields --- */
 #define GUEST_CR0   0x6800u

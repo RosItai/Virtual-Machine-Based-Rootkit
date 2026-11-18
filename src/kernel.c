@@ -1,11 +1,6 @@
 /* kernel.c
  * A minimal kernel that proves the boot chain worked by printing
- * centered ASCII art over the serial port (visible in your terminal
- * when QEMU is run with -nographic).
- *
- * Instead of guessing the terminal width, this version asks the
- * terminal to report its own size via an ANSI query, and falls back
- * to a safe default only if nothing answers in time.
+ * centered ASCII art over the serial port.
  */
 #include <stdint.h>
 #include "serial.h"
@@ -174,7 +169,7 @@ static void print_art_and_author(int term_width) {
 void kernel_main(void) {
     serial_init();
     serial_print("\033[2J");
-
+    
     int width = query_terminal_width();
     if (width <= 0) width = FALLBACK_WIDTH;
 

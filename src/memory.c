@@ -36,6 +36,44 @@
 #define DEBUG_ALLOCATIONS 0
 #endif
 
+/* Laid down by the linker script, so they're addresses, not variables -
+ * taking the address of each is the only correct way to read one. */
+extern uint8_t __kernel_start[];
+extern uint8_t __kernel_end[];
+
+/* The running union of every allocation, kept here because this is the
+ * only code that knows where they land. Seeded from the kernel image
+ * itself: that memory is just as much the VMM's, and just as reachable
+ * by a guest, even though no allocator handed it out. */
+static uint64_t reservedBase = 0;
+static uint64_t reservedEnd = 0;
+
+static void recordReservedRange(uint64_t base, uint64_t end) {
+    if (reservedEnd == 0) {
+        reservedBase = (uint64_t)__kernel_start;
+        reservedEnd = (uint64_t)__kernel_end;
+    }
+    if (base < reservedBase) {
+        reservedBase = base;
+    }
+    if (end > reservedEnd) {
+        reservedEnd = end;
+    }
+}
+
+int getVmmReservedRange(uint64_t *base, uint64_t *end) {
+    if (reservedEnd == 0) {
+        /* Nothing allocated yet, but the kernel image is already there
+         * and already needs protecting. */
+        *base = (uint64_t)__kernel_start;
+        *end = (uint64_t)__kernel_end;
+        return 1;
+    }
+    *base = reservedBase;
+    *end = reservedEnd;
+    return 1;
+}
+
 void *allocateMemory(uint64_t length) {
     MemoryMapTable *table = (MemoryMapTable *)MEMORY_MAP_TABLE_ADDR;
     uint64_t len = ALIGN_UP(length, PAGE_SIZE);
@@ -60,6 +98,7 @@ void *allocateMemory(uint64_t length) {
 
     region->length -= len;
     memset(allocationAddress, 0, len);
+    recordReservedRange((uint64_t)allocationAddress, allocationEnd);
 
 #if DEBUG_ALLOCATIONS
     logInfo("allocateMemory: %lu bytes at %p (region %d, %lu bytes left there)\n",

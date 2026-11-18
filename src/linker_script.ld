@@ -12,6 +12,13 @@ SECTIONS
 {
     . = 1M;
 
+    /* The kernel image's own bounds, for the memory the VMM has to
+     * protect from the guest: everything between these two symbols is
+     * host code and data sitting in ordinary, guest-reachable RAM.
+     * Declared here rather than guessed in C, because only the linker
+     * knows where .bss actually ends. */
+    __kernel_start = .;
+
     .text ALIGN(4K) :
     {
         *(.multiboot_header)
@@ -33,4 +40,6 @@ SECTIONS
         *(COMMON)
         *(.bss)
     }
+
+    __kernel_end = ALIGN(4K);
 }

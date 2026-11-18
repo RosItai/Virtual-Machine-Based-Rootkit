@@ -8,10 +8,33 @@
 
 #include <stdint.h>
 
-static inline void cpuid(uint32_t leaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+/* Some CPUID leaves (0x7, 0xD, 0x1F...) return different data per
+ * subleaf in ECX, so forwarding a guest's CPUID needs ECX passed
+ * through rather than zeroed - hence the Ex variant. */
+static inline void cpuidEx(uint32_t leaf, uint32_t subleaf,
+                           uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
     __asm__ volatile("cpuid"
                       : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
-                      : "a"(leaf), "c"(0));
+                      : "a"(leaf), "c"(subleaf));
+}
+
+static inline void cpuid(uint32_t leaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+    cpuidEx(leaf, 0, eax, ebx, ecx, edx);
+}
+
+/* Write back and invalidate the caches. Stands in for the guest's INVD
+ * (which discards dirty lines without writing them back, and would
+ * corrupt memory the host still cares about) - see handleVmExit. */
+static inline void wbinvd(void) {
+    __asm__ volatile("wbinvd" : : : "memory");
+}
+
+/* XSETBV writes an extended control register (XCR0 for index 0). Needs
+ * CR4.OSXSAVE set, or it #GPs. */
+static inline void xsetbv(uint32_t index, uint64_t value) {
+    __asm__ volatile("xsetbv"
+                      :
+                      : "c"(index), "a"((uint32_t)value), "d"((uint32_t)(value >> 32)));
 }
 
 static inline uint64_t readMsr(uint32_t msr) {
