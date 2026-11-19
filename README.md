@@ -1,4 +1,4 @@
-# VMBR - Multiboot2 kernel project
+# Bare-Metal Hypervisor Rootkit
 
 ## Project layout
 
