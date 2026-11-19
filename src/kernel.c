@@ -132,12 +132,7 @@ static int leading_spaces(const char *s) {
     return n;
 }
 
-/* All art lines share the same length, so they all land on the same
- * starting column when centered - but they don't all have the same
- * number of leading spaces inside the string (the top of the V only
- * needs 1, lower rows need more to taper), so the visible ink doesn't
- * all start at that column. Find the leftmost actual ink column across
- * every row and align the author line to THAT, not to base_col itself. */
+
 static void print_art_and_author(int term_width) {
     int num_lines = 0;
     while (art[num_lines]) num_lines++;

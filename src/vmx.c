@@ -24,6 +24,7 @@
 #include "vmcs.h"
 #include "vmexit.h"
 #include "ept.h"
+#include "hooks.h"
 
 /* CPUID.1:ECX.VMX[bit 5] */
 static int checkForVmxSupport(void) {
@@ -610,18 +611,15 @@ void InitializeVmm(void) {
         return;
     }
 
-    /* Everything the VMM owns has been allocated by now, so this is
-     * the first point the span is final - and it's exactly what the
-     * guest's E820 map will have to declare reserved. */
-    uint64_t reservedBase;
-    uint64_t reservedEnd;
-    if (getVmmReservedRange(&reservedBase, &reservedEnd)) {
-        logInfo("VMM memory to protect: %lx-%lx (%lu KB)\n",
-                reservedBase, reservedEnd, (reservedEnd - reservedBase) / 1024);
-    }
-
     logSection("Guest");
     copyRealModeGuest();
+
+    /* Everything the VMM owns has been allocated by now, so the
+     * reserved ranges are final - install the E820 hook that hides
+     * them from the guest. Must come after the guest is copied in (the
+     * stub lands just above it) and before launch. */
+    installGuestHooks();
+
     logInfo("Guest is launching...\n");
     vmlaunch();
 }

@@ -23,6 +23,7 @@
 #include "vmcs.h"
 #include "cpu.h"
 #include "debug.h"
+#include "hooks.h"
 
 /* ===================================================================
  * Guest register access
@@ -501,13 +502,24 @@ void handleVmExit(GuestRegisters *regs) {
      * platform underneath us. RSM belongs here for the same reason:
      * QEMU runs with -machine smm=off, so a guest trying to return
      * from SMM is confused, not legitimate. */
+    /* VMCALL is how our own hooks call back into the host, marked by a
+     * magic value in EBP. A VMCALL without that marker is a guest
+     * probing or confused, and falls through to the #UD below with the
+     * rest of the VMX instructions. */
+    case EXIT_REASON_VMCALL:
+        if (handleHypercall(ctx)) {
+            advanceGuestRip(ctx);
+            return;
+        }
+        injectException(EXCEPTION_VECTOR_UD, 0, 0);
+        return;
+
     case EXIT_REASON_GETSEC:
     case EXIT_REASON_RSM:
     /* Every VMX instruction exits unconditionally. Since CPUID reports
      * no VMX, a guest executing one is either probing for a
      * hypervisor or confused - #UD is what it would get on a CPU
      * without VMX, so that's what it gets. */
-    case EXIT_REASON_VMCALL:
     case EXIT_REASON_VMCLEAR:
     case EXIT_REASON_VMLAUNCH:
     case EXIT_REASON_VMPTRLD:

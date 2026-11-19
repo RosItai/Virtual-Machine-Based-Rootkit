@@ -41,37 +41,45 @@
 extern uint8_t __kernel_start[];
 extern uint8_t __kernel_end[];
 
-/* The running union of every allocation, kept here because this is the
- * only code that knows where they land. Seeded from the kernel image
- * itself: that memory is just as much the VMM's, and just as reachable
- * by a guest, even though no allocator handed it out. */
-static uint64_t reservedBase = 0;
-static uint64_t reservedEnd = 0;
+/* The allocator's footprint, tracked separately from the kernel image
+ * rather than merged into one span. The two sit far apart - the kernel
+ * at 1MB, the allocations near the top of RAM - so a single enclosing
+ * range would cover the ~2GB of guest RAM between them and leave the
+ * guest almost nothing. Every allocation is a bump downward from the
+ * top of one region, so they stay contiguous and [allocLow, allocHigh)
+ * is tight. allocHigh == 0 means nothing has been allocated yet. */
+static uint64_t allocLow = 0;
+static uint64_t allocHigh = 0;
 
-static void recordReservedRange(uint64_t base, uint64_t end) {
-    if (reservedEnd == 0) {
-        reservedBase = (uint64_t)__kernel_start;
-        reservedEnd = (uint64_t)__kernel_end;
+static void recordAllocation(uint64_t base, uint64_t end) {
+    if (allocHigh == 0 || end > allocHigh) {
+        allocHigh = end;
     }
-    if (base < reservedBase) {
-        reservedBase = base;
-    }
-    if (end > reservedEnd) {
-        reservedEnd = end;
+    if (allocLow == 0 || base < allocLow) {
+        allocLow = base;
     }
 }
 
-int getVmmReservedRange(uint64_t *base, uint64_t *end) {
-    if (reservedEnd == 0) {
-        /* Nothing allocated yet, but the kernel image is already there
-         * and already needs protecting. */
-        *base = (uint64_t)__kernel_start;
-        *end = (uint64_t)__kernel_end;
-        return 1;
+int getVmmReservedRanges(MemoryRange *ranges, int maxRanges) {
+    int count = 0;
+
+    /* The kernel image always needs protecting - it's the VMM's code
+     * and data, sitting in ordinary RAM a guest can reach. */
+    if (count < maxRanges) {
+        ranges[count].base = (uint64_t)__kernel_start;
+        ranges[count].end = (uint64_t)__kernel_end;
+        count++;
     }
-    *base = reservedBase;
-    *end = reservedEnd;
-    return 1;
+
+    /* The allocations (EPT tables, host stack, VMXON/VMCS, page
+     * tables) are a second, separate range. */
+    if (allocHigh != 0 && count < maxRanges) {
+        ranges[count].base = allocLow;
+        ranges[count].end = allocHigh;
+        count++;
+    }
+
+    return count;
 }
 
 void *allocateMemory(uint64_t length) {
@@ -98,7 +106,7 @@ void *allocateMemory(uint64_t length) {
 
     region->length -= len;
     memset(allocationAddress, 0, len);
-    recordReservedRange((uint64_t)allocationAddress, allocationEnd);
+    recordAllocation((uint64_t)allocationAddress, allocationEnd);
 
 #if DEBUG_ALLOCATIONS
     logInfo("allocateMemory: %lu bytes at %p (region %d, %lu bytes left there)\n",
