@@ -7,7 +7,7 @@
                       by: Itai Rosenperl
 ```
 
-# VMBR — a Type-1 hypervisor from scratch
+# Bare-Metal Hypervisor Rootkit
 
 ![lang](https://img.shields.io/badge/C-%2300599C?logo=c&logoColor=white)
 ![asm](https://img.shields.io/badge/NASM-x86--64-6E4C13)
