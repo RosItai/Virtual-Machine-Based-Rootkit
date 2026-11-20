@@ -55,6 +55,7 @@ extern GDT_CODE64_SEL
 extern GDT_DATA64_SEL
 
 global bios_load_memory_map
+global bios_read_disk
 
 ; 0x8000 (the original choice) sits in the 0x7E00-0x9FBFF range that's
 ; conventionally "free" but NOT the specifically BIOS-trusted zone real
@@ -111,6 +112,36 @@ bios_load_memory_map:
     mov rax, TRAMPOLINE_ADDR
     call rax
     ret
+
+; int bios_read_disk(uint8_t drive, dap_t *dap_ptr)
+; Calls BIOS int 0x13, ah=0x42 (extended read) with the given DAP structure.
+; The DAP contains the LBA sector number, number of sectors, and buffer address.
+; Returns AH (BIOS error code): 0 = success, non-zero = error
+; CF is converted to a return code (bit in AH) for easier C-side checking.
+bios_read_disk:
+    push rbx
+    push rsi
+
+    ; rdi = drive, rsi = dap_ptr (System V AMD64 ABI calling convention)
+    ; Store for use in trampoline
+    mov [rel disk_read_params], rdi      ; save drive number
+    mov [rel disk_read_params + 8], rsi  ; save dap_ptr
+
+    lea rsi, [rel bios_disk_trampoline_start]
+    mov rdi, TRAMPOLINE_ADDR
+    mov rcx, bios_disk_trampoline_end - bios_disk_trampoline_start
+    rep movsb
+
+    mov rax, TRAMPOLINE_ADDR
+    call rax                             ; sets rax to AH return code
+
+    pop rsi
+    pop rbx
+    ret
+
+disk_read_params:
+    dq 0  ; drive number
+    dq 0  ; dap_ptr
 
 ; ===================================================================
 ; Copied to TRAMPOLINE_ADDR before it runs - see FLAT()/BLOB_OFF()
@@ -303,3 +334,136 @@ saved_rsp:
     dq 0
 
 bios_trampoline_end:
+
+; ===================================================================
+; Disk read trampoline - runs in real mode to call int 0x13
+; This is a separate trampoline from bios_trampoline because the
+; memory layout and parameters are different.
+; ===================================================================
+bios_disk_trampoline_start:
+
+    cli
+    mov [rel disk_saved_rsp], rsp
+    mov rsp, TRAMPOLINE_ADDR - 0x10
+
+    ; ---- 64-bit long mode -> 32-bit compatibility mode ----
+    push GDT_CODE32_SEL
+    push FLAT(disk_compat32)
+    retfq
+
+bits 32
+disk_compat32:
+    ; ---- leave IA-32e mode entirely ----
+    mov eax, cr0
+    and eax, 0x7FFFFFFF                ; clear PG
+    mov cr0, eax
+
+    mov ecx, 0xC0000080                ; IA32_EFER
+    rdmsr
+    and eax, 0xFFFFFEFF                ; clear LME
+    wrmsr
+
+    mov eax, GDT_DATA32_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; ---- 32-bit protected -> 16-bit protected ----
+    push GDT_CODE16_SEL
+    push FLAT(disk_prot16)
+    retfd
+
+bits 16
+disk_prot16:
+    mov eax, cr0
+    and al, 0xFE                       ; clear PE
+    mov cr0, eax
+
+    ; Reload real-mode IDT before BIOS calls
+    lidt [FLAT(real_mode_idt_ptr)]
+
+    jmp REAL_MODE_SEGMENT:BLOB_OFF(disk_real_entry)
+
+disk_real_entry:
+    ; True real mode - set up segments
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov esp, REAL_MODE_STACK
+
+    ; ---- BIOS int 0x13, ah=0x42 (extended read sectors) ----
+    ; Load parameters from disk_read_params (which were saved in long mode)
+    mov dl, byte [FLAT(disk_read_params)]       ; drive number
+    mov si, word [FLAT(disk_read_params + 8)]  ; DAP offset (DAP is in low memory)
+
+    ; Execute the int 0x13 call
+    mov ah, 0x42                               ; Extended Read Sectors function
+    int 0x13
+
+    ; Save result in AL (error code from BIOS)
+    mov byte [FLAT(disk_result)], al
+    jnc .disk_read_ok
+    mov byte [FLAT(disk_result)], 1            ; If CF set, return error code 1
+.disk_read_ok:
+
+    ; ---- real mode -> 16-bit protected mode ----
+    mov eax, cr0
+    or al, 1                           ; set PE
+    mov cr0, eax
+
+    push dword GDT_CODE32_SEL
+    push dword FLAT(disk_prot32)
+    retfd
+
+bits 32
+disk_prot32:
+    mov eax, GDT_DATA32_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; ---- 32-bit protected -> re-enter long mode ----
+    mov eax, cr4
+    or eax, 1 << 5                     ; PAE
+    mov cr4, eax
+
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 1 << 8                     ; LME
+    wrmsr
+
+    mov eax, cr0
+    or eax, 1 << 31                    ; PG
+    mov cr0, eax
+
+    push GDT_CODE64_SEL
+    push FLAT(disk_long64)
+    retfd
+
+bits 64
+disk_long64:
+    mov eax, GDT_DATA64_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; Return the error code from disk read in RAX
+    movzx eax, byte [rel disk_result]
+
+    mov rsp, [rel disk_saved_rsp]
+    ret
+
+disk_saved_rsp:
+    dq 0
+
+disk_result:
+    db 0
+
+bios_disk_trampoline_end:
