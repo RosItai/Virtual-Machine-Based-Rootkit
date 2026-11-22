@@ -15,10 +15,12 @@
 #include "debug.h"
 #include "cpu.h"
 
-/* Same 4GB paging.asm maps for the host (MEM_SIZE_GB there - keep the
- * two in sync). That covers RAM and the MMIO below 4GB, e.g. the Local
- * APIC at 0xFEE00000, so the guest can reach everything the host can. */
-#define EPT_MAPPED_GB 4ull
+/* Same span paging.asm maps for the host (MEM_SIZE_GB there - keep the
+ * three in sync: paging.asm MEM_SIZE_GB, host_paging.c HOST_MAPPED_GB,
+ * and memory.c ALLOC_LIMIT). Covers the guest's RAM and the MMIO below
+ * 4GB (Local APIC at 0xFEE00000), so the guest reaches everything the
+ * host can. 8GB is the Windows 10 recommended-minimum sweet spot. */
+#define EPT_MAPPED_GB 8ull
 #define ENTRIES_PER_TABLE 512ull
 
 /* ===================================================================

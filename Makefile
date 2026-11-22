@@ -151,4 +151,4 @@ clean:
 	rm -rf build
 
 .PHONY: build run debug clean
-# make build && make run-gui DISK_IMG=/mnt/d/CyberProject12/VMBR/Win10/win10.qcow2 DISK_FMT=qcow2 MEM=2G
+# make build && make run-gui DISK_IMG=/mnt/d/CyberProject12/VMBR/Win10/win10.qcow2 DISK_FMT=qcow2 MEM=8G

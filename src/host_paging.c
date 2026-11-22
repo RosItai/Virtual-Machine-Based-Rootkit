@@ -19,7 +19,7 @@
 #include "cpu.h"
 #include "debug.h"
 
-#define HOST_MAPPED_GB    4ull /* keep in sync with MEM_SIZE_GB in paging.asm */
+#define HOST_MAPPED_GB    8ull /* keep in sync with MEM_SIZE_GB in paging.asm */
 #define ENTRIES_PER_TABLE 512ull
 #define LARGE_PAGE_SIZE   0x200000ull
 

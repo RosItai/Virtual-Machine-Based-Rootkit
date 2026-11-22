@@ -32,14 +32,15 @@
 #define ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
 
 /* Upper bound on any address the allocator may return. Both the boot
- * page tables (paging.asm, MEM_SIZE_GB=4) and the host page tables
- * initializeHostPaging builds (HOST_MAPPED_GB=4) identity-map only the
- * first 4GB - handing out an address above that triple-faults the moment
- * the allocator memsets it. With `-m 4G` QEMU splits RAM around the PCI
- * hole: ~3GB below 4GB, the rest above - and that above-4GB chunk is
- * the LAST usable E820 region, which the picker below would otherwise
- * prefer. Clamp regionEnd at the 4GB mark instead. */
-#define ALLOC_LIMIT 0x100000000ull
+ * page tables (paging.asm, MEM_SIZE_GB=8) and the host page tables
+ * initializeHostPaging builds (HOST_MAPPED_GB=8) identity-map only the
+ * first 8GB - handing out an address above that triple-faults the moment
+ * the allocator memsets it. With `-m 8G` QEMU splits RAM around the PCI
+ * hole: ~3GB below 4GB, the rest above, and the LAST usable E820 region
+ * can sit above the paging ceiling, which the picker below would
+ * otherwise prefer. Clamp regionEnd at the ceiling instead. Keep in sync
+ * with the three MAPPED_GB constants referenced above. */
+#define ALLOC_LIMIT 0x200000000ull
 
 /* Off by default - set to 1 to log every allocation when debugging. */
 #ifndef DEBUG_ALLOCATIONS

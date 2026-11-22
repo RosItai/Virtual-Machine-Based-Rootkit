@@ -19,7 +19,7 @@ PTE_PAGESIZE    equ 1 << 7   ; PD entry: this maps a 2MB page directly
 
 LARGE_PAGE_SIZE equ 0x200000 ; 2MB - the span one PD entry covers with PTE_PAGESIZE set
 
-MEM_SIZE_GB equ 4
+MEM_SIZE_GB equ 8
 
 section .bss
 align 4096
@@ -58,17 +58,25 @@ setup_paging:
     loop .map_pdpt
 
     ; ---- Every PD entry, across all MEM_SIZE_GB tables: one 2MB page ----
+    ; eax carries the low 32 bits of the next physical address, esi the
+    ; high 32 bits. The naive single-eax loop silently wrapped at 4GB,
+    ; so with MEM_SIZE_GB=8 the entries that should map 4GB..8GB got
+    ; address 0 instead and collided with the first-GB mapping - adc
+    ; propagates the carry out of eax into esi, which then goes into
+    ; the high half of each PDE (was hardcoded to 0).
     mov ecx, MEM_SIZE_GB
     shl ecx, 9                          ; * 512 entries/table = total PD entries
-    xor eax, eax                        ; first mapped physical address: 0
+    xor eax, eax                        ; low 32 bits of next physical address
+    xor esi, esi                        ; high 32 bits of next physical address
     mov edi, pd_tables
 .map_pd:
     mov edx, eax
     or edx, PTE_PRESENT | PTE_WRITEABLE | PTE_PAGESIZE
     mov dword [edi], edx
-    mov dword [edi + 4], 0
+    mov dword [edi + 4], esi
     add edi, 8
     add eax, LARGE_PAGE_SIZE
+    adc esi, 0                          ; carry crosses the 4GB boundary
     loop .map_pd
 
     ret
