@@ -66,4 +66,11 @@ EptTableEntry *initializeEpt(void);
  * supports a 4-level walk and a usable memory type. 0 on failure. */
 uint64_t buildEptPointer(EptTableEntry *pml4);
 
+/* Walks `pml4` and clears R/W/X on every 4KB page in [base, end). Once
+ * the guest is running, any access to those pages exits with
+ * EXIT_REASON_EPT_VIOLATION - which is how we keep a guest OS from
+ * silently corrupting VMBR's own pages when it ignores the "reserved"
+ * markings in the E820 map it sees. */
+void hideEptRange(EptTableEntry *pml4, uint64_t base, uint64_t end);
+
 #endif

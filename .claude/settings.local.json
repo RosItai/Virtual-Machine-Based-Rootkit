@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gcc --version)",
+      "Bash(nasm -v)",
+      "Bash(gcc -c -nostdlib -fno-builtin -fno-stack-protector -m64 -mno-red-zone -mcmodel=large -ffreestanding -fno-pic -g -I./include src/serial_disk.c -o /tmp/test_serial_disk.o)",
+      "Bash(gcc -Wall -Wextra -O2 -std=c99 -o serial_disk_loader serial_disk_loader.c)",
+      "Bash(gcc -c -nostdlib -fno-builtin -fno-stack-protector -m64 -mno-red-zone -mcmodel=large -ffreestanding -fno-pic -g -I./include src/disk.c -o /tmp/test_disk.o)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
+    ]
+  }
+}

@@ -210,6 +210,92 @@ static uint64_t crOperandValue(uint64_t value) {
     return (ia32eMode && sixtyFourBitCode) ? value : (uint32_t)value;
 }
 
+/* ===================================================================
+ * Port I/O - only the three reset-capable ports reach here (bitmap)
+ * =================================================================== */
+
+static void handleIoInstruction(VmExitContext *ctx) {
+    uint64_t qual    = ctx->exitQualification;
+    uint16_t port    = IO_ACCESS_PORT(qual);
+    int      isIn    = IO_ACCESS_IS_IN(qual);
+    uint32_t szCode  = IO_ACCESS_SIZE(qual);  /* 0=byte, 1=word, 3=dword */
+    uint32_t bytes   = (szCode == 3) ? 4u : (1u << szCode);
+
+    /* String I/O (INS/OUTS) or REP on these ports is bizarre - halt. */
+    if (IO_ACCESS_IS_STRING(qual) || IO_ACCESS_HAS_REP(qual)) {
+        logError("string/REP I/O on port 0x%x - not emulated, halting\n", port);
+        dumpVmcsState();
+        haltForever();
+        return;
+    }
+
+    if (!isIn) {
+        /* OUT: check if the guest is triggering a hardware reset.
+         * KBC reset: command 0xF0-0xFE on port 0x64 pulses the output-port
+         * bits that are CLEAR in the low nibble (bit 0 = CPU reset line).
+         * So anything with the high nibble 0xF and bit 0 CLEAR pulses the
+         * RC line - not just the textbook 0xFE. */
+        uint32_t val = (uint32_t)ctx->registers->rax;
+        if      (bytes == 1) val &= 0xFFu;
+        else if (bytes == 2) val &= 0xFFFFu;
+
+        int kbcPulseReset = (port == 0x64) && ((val & 0xF0u) == 0xF0u) && !(val & 0x01u);
+        int isReset =
+            kbcPulseReset                                                     ||
+            (port == 0x92  && (val & 0x01u))         /* fast A20/CPU reset */ ||
+            (port == 0xCF9 && (val & 0x04u));        /* PCI system reset   */
+
+        if (isReset) {
+            logError("GUEST HARDWARE RESET via port 0x%x (val=0x%x, %u byte)\n",
+                     port, val, bytes);
+            dumpVmcsState();
+            haltForever();
+            return;
+        }
+
+        /* KBC command 0xFF: "pulse output port" with mask 0xF - no bits
+         * marked for pulsing, so on real hardware it is a no-op "flush".
+         * Some QEMU i8042 emulations decode the whole 0xF_ range as
+         * potentially reset-adjacent and have been observed turning this
+         * into a machine reset. Swallow it rather than passing it on -
+         * the guest hasn't asked for a reset, so losing the command is
+         * harmless. */
+        if (port == 0x64 && val == 0xFFu) {
+            logInfo("guest OUT port=0x64 val=0xff - swallowed (no-op pulse)\n");
+            advanceGuestRip(ctx);
+            return;
+        }
+
+        /* Non-reset write to an intercepted port - pass through. The
+         * 4-byte OUT at 0xCF8 (PCI config address) is the overwhelming
+         * majority of this once a guest OS enumerates PCI, so skip
+         * logging it to keep the serial log readable; the write still
+         * passes through, just quietly. */
+        if (!(port == 0xCF8 && bytes == 4)) {
+            logInfo("guest OUT port=0x%x val=0x%x (%uB) - passing through\n",
+                    port, val, bytes);
+        }
+        switch (bytes) {
+        case 1: __asm__ volatile("outb %b0, %w1" : : "a"((uint8_t) val), "Nd"(port)); break;
+        case 2: __asm__ volatile("outw %w0, %w1" : : "a"((uint16_t)val), "Nd"(port)); break;
+        case 4: __asm__ volatile("outl %k0, %w1" : : "a"((uint32_t)val), "Nd"(port)); break;
+        }
+    } else {
+        /* IN: pass through and hand the result back to the guest. */
+        uint32_t val = 0;
+        switch (bytes) {
+        case 1: { uint8_t  b; __asm__ volatile("inb %w1, %b0" : "=a"(b) : "Nd"(port)); val = b; } break;
+        case 2: { uint16_t w; __asm__ volatile("inw %w1, %w0" : "=a"(w) : "Nd"(port)); val = w; } break;
+        case 4: { uint32_t d; __asm__ volatile("inl %w1, %k0" : "=a"(d) : "Nd"(port)); val = d; } break;
+        }
+        /* IN zeroes the upper bits: byte IN clears bits 31:8, etc. */
+        ctx->registers->rax = val;
+        logInfo("guest IN  port=0x%x → 0x%x (%uB)\n", port, val, bytes);
+    }
+
+    advanceGuestRip(ctx);
+}
+
 static void handleCrAccess(VmExitContext *ctx) {
     GuestRegisters *regs = ctx->registers;
     uint64_t qualification = ctx->exitQualification;
@@ -536,6 +622,10 @@ void handleVmExit(GuestRegisters *regs) {
         return;
 
     /* --- Control-gated exits --- */
+    case EXIT_REASON_IO_INSTRUCTION:
+        handleIoInstruction(ctx);
+        return;
+
     case EXIT_REASON_CR_ACCESS:
         handleCrAccess(ctx);
         return;

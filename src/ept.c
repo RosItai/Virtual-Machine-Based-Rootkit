@@ -254,6 +254,31 @@ EptTableEntry *initializeEpt(void) {
     return pml4;
 }
 
+void hideEptRange(EptTableEntry *pml4, uint64_t base, uint64_t end) {
+    /* Covers the full 4KB page each endpoint touches - a reserved range
+     * that doesn't start or end on a page boundary still gets the whole
+     * page behind it hidden, which is what callers want. */
+    uint64_t pageStart = base & ~(PAGE_SIZE - 1);
+    uint64_t pageEnd = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t hidden = 0;
+
+    for (uint64_t addr = pageStart; addr < pageEnd; addr += PAGE_SIZE) {
+        /* Walk PML4 -> PDPT -> PD -> PT, same shape as translate(). The
+         * EPT is 4KB-paged throughout, so every page has a PTE and no
+         * entry needs to be split. */
+        EptTableEntry *pdpt = (EptTableEntry *)((uint64_t)pml4[(addr >> 39) & 0x1FF].fields.nextTableFrame << 12);
+        EptTableEntry *pd   = (EptTableEntry *)((uint64_t)pdpt[(addr >> 30) & 0x1FF].fields.nextTableFrame << 12);
+        EptPageEntry *pt    = (EptPageEntry *) ((uint64_t)pd[(addr >> 21) & 0x1FF].fields.nextTableFrame << 12);
+        EptPageEntry *pte   = &pt[(addr >> 12) & 0x1FF];
+        pte->fields.read = 0;
+        pte->fields.write = 0;
+        pte->fields.execute = 0;
+        hidden++;
+    }
+
+    logInfo("EPT: hid %lu pages covering %lx-%lx\n", hidden, pageStart, pageEnd);
+}
+
 #define IA32_VMX_EPT_VPID_CAP_MSR 0x48Cu
 #define EPT_CAP_WALK_LENGTH_4     (1ull << 6)
 #define EPT_CAP_MEMORY_TYPE_UC    (1ull << 8)

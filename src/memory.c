@@ -31,6 +31,16 @@
 #define ALIGN_UP(x, align)   (((x) + (align) - 1) & ~((align) - 1))
 #define ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
 
+/* Upper bound on any address the allocator may return. Both the boot
+ * page tables (paging.asm, MEM_SIZE_GB=4) and the host page tables
+ * initializeHostPaging builds (HOST_MAPPED_GB=4) identity-map only the
+ * first 4GB - handing out an address above that triple-faults the moment
+ * the allocator memsets it. With `-m 4G` QEMU splits RAM around the PCI
+ * hole: ~3GB below 4GB, the rest above - and that above-4GB chunk is
+ * the LAST usable E820 region, which the picker below would otherwise
+ * prefer. Clamp regionEnd at the 4GB mark instead. */
+#define ALLOC_LIMIT 0x100000000ull
+
 /* Off by default - set to 1 to log every allocation when debugging. */
 #ifndef DEBUG_ALLOCATIONS
 #define DEBUG_ALLOCATIONS 0
@@ -87,24 +97,35 @@ void *allocateMemory(uint64_t length) {
     uint64_t len = ALIGN_UP(length, PAGE_SIZE);
 
     /* Last usable region with enough room wins - simple, not best-fit,
-     * good enough while every allocation still happens at boot time. */
+     * good enough while every allocation still happens at boot time.
+     * Clamped to ALLOC_LIMIT: a region's effective top is min(real top,
+     * 4GB), and it has to fit `len` below that ceiling - otherwise an
+     * above-4GB region wins and memset faults on the first page. */
     int32_t chosen = -1;
+    uint64_t chosenEnd = 0;
     for (uint32_t i = 0; i < table->numberOfEntries; i++) {
-        if (table->entries[i].type == E820_USABLE &&
-            table->entries[i].length >= len) {
-            chosen = (int32_t)i;
-        }
+        if (table->entries[i].type != E820_USABLE) continue;
+        uint64_t base = table->entries[i].baseAddress;
+        if (base >= ALLOC_LIMIT) continue;
+        uint64_t end = base + table->entries[i].length;
+        if (end > ALLOC_LIMIT) end = ALLOC_LIMIT;
+        if (end - base < len) continue;
+        chosen = (int32_t)i;
+        chosenEnd = end;
     }
     if (chosen < 0) {
         return 0;
     }
 
     MemoryMapEntry *region = &table->entries[chosen];
-    uint64_t regionEnd = region->baseAddress + region->length;
-    uint64_t allocationEnd = ALIGN_DOWN(regionEnd, PAGE_SIZE);
+    uint64_t allocationEnd = ALIGN_DOWN(chosenEnd, PAGE_SIZE);
     void *allocationAddress = (void *)(allocationEnd - len);
 
-    region->length -= len;
+    /* Shrink the region from the top by however much we just took,
+     * including the amount we clipped off above the 4GB line - the
+     * region above the clip is unreachable anyway, so hiding it keeps
+     * later calls honest about what's still available. */
+    region->length -= (region->baseAddress + region->length) - (allocationEnd - len);
     memset(allocationAddress, 0, len);
     recordAllocation((uint64_t)allocationAddress, allocationEnd);
 

@@ -121,11 +121,17 @@ bios_load_memory_map:
 bios_read_disk:
     push rbx
     push rsi
+    push rdi
 
-    ; rdi = drive, rsi = dap_ptr (System V AMD64 ABI calling convention)
-    ; Store for use in trampoline
-    mov [rel disk_read_params], rdi      ; save drive number
-    mov [rel disk_read_params + 8], rsi  ; save dap_ptr
+    ; rdi = drive, rsi = dap_ptr (System V AMD64 ABI).
+    ; The real-mode payload can't reach these registers (or any high
+    ; kernel address) once it has dropped to 16-bit, so the two values
+    ; it needs are written into slots that live *inside* the disk blob
+    ; and therefore travel with it when the rep movsb below copies the
+    ; blob down to low memory. Writing them to the blob's source copy
+    ; here (via [rel ...]) means the copy carries the written values.
+    mov [rel disk_tramp_drive], dil      ; drive number (low byte)
+    mov [rel disk_tramp_dapoff], si      ; DAP offset (low 16 bits; DAP is <64KB)
 
     lea rsi, [rel bios_disk_trampoline_start]
     mov rdi, TRAMPOLINE_ADDR
@@ -135,13 +141,10 @@ bios_read_disk:
     mov rax, TRAMPOLINE_ADDR
     call rax                             ; sets rax to AH return code
 
+    pop rdi
     pop rsi
     pop rbx
     ret
-
-disk_read_params:
-    dq 0  ; drive number
-    dq 0  ; dap_ptr
 
 ; ===================================================================
 ; Copied to TRAMPOLINE_ADDR before it runs - see FLAT()/BLOB_OFF()
@@ -336,19 +339,38 @@ saved_rsp:
 bios_trampoline_end:
 
 ; ===================================================================
-; Disk read trampoline - runs in real mode to call int 0x13
-; This is a separate trampoline from bios_trampoline because the
-; memory layout and parameters are different.
+; Disk read trampoline - runs in real mode to call int 0x13.
+;
+; This is a SEPARATE blob from bios_trampoline, copied down to
+; TRAMPOLINE_ADDR on its own. That means its internal absolute
+; references must be computed relative to THIS blob's start, not
+; bios_trampoline_start - so it has its own DFLAT()/DBLOB_OFF() macros.
+; Using the shared FLAT()/BLOB_OFF() here (anchored to the other blob)
+; was the original bug: every mode-switch target and data reference
+; landed a whole blob-length off and the CPU reset mid-transition.
+;
+; Everything the real-mode payload needs - the drive number, the DAP
+; offset, the IDT pointer, the result byte, the saved RSP - lives
+; inside this blob too, so one rep movsb brings it all into low memory
+; where 16-bit code can actually reach it. The high kernel copy of
+; disk_read_params (the previous approach) was unreachable from real
+; mode.
 ; ===================================================================
+%define DBLOB_OFF(label) ((label) - bios_disk_trampoline_start)
+%define DFLAT(label) (TRAMPOLINE_ADDR + DBLOB_OFF(label))
+
 bios_disk_trampoline_start:
 
     cli
-    mov [rel disk_saved_rsp], rsp
+    mov [rel disk_saved_rsp], rsp     ; RIP-relative: we're already running
+                                       ; the low copy, so this hits the low
+                                       ; copy's slot (read back the same way
+                                       ; at the end)
     mov rsp, TRAMPOLINE_ADDR - 0x10
 
     ; ---- 64-bit long mode -> 32-bit compatibility mode ----
     push GDT_CODE32_SEL
-    push FLAT(disk_compat32)
+    push DFLAT(disk_compat32)
     retfq
 
 bits 32
@@ -372,7 +394,7 @@ disk_compat32:
 
     ; ---- 32-bit protected -> 16-bit protected ----
     push GDT_CODE16_SEL
-    push FLAT(disk_prot16)
+    push DFLAT(disk_prot16)
     retfd
 
 bits 16
@@ -381,10 +403,15 @@ disk_prot16:
     and al, 0xFE                       ; clear PE
     mov cr0, eax
 
-    ; Reload real-mode IDT before BIOS calls
-    lidt [FLAT(real_mode_idt_ptr)]
+    ; Reload the real-mode IVT descriptor before any BIOS interrupt
+    ; (this blob's own copy - see the identical step in the E820 blob).
+    lidt [DFLAT(disk_real_mode_idt_ptr)]
 
-    jmp REAL_MODE_SEGMENT:BLOB_OFF(disk_real_entry)
+    jmp REAL_MODE_SEGMENT:DBLOB_OFF(disk_real_entry)
+
+disk_real_mode_idt_ptr:
+    dw 0x3FF                           ; limit: 256 * 4 - 1
+    dd 0                                ; base: IVT at physical 0
 
 disk_real_entry:
     ; True real mode - set up segments
@@ -395,27 +422,31 @@ disk_real_entry:
     mov esp, REAL_MODE_STACK
 
     ; ---- BIOS int 0x13, ah=0x42 (extended read sectors) ----
-    ; Load parameters from disk_read_params (which were saved in long mode)
-    mov dl, byte [FLAT(disk_read_params)]       ; drive number
-    mov si, word [FLAT(disk_read_params + 8)]  ; DAP offset (DAP is in low memory)
+    ; DS:SI must point at the DAP. DS=0 (just set), and disk_tramp_dapoff
+    ; holds DAP_ADDRESS (<64KB), so DS:SI = 0x0000:DAP_ADDRESS. DL is the
+    ; drive number. Both were copied in with the blob.
+    mov dl, [DFLAT(disk_tramp_drive)]          ; drive number
+    mov si, [DFLAT(disk_tramp_dapoff)]         ; DAP offset
 
-    ; Execute the int 0x13 call
-    mov ah, 0x42                               ; Extended Read Sectors function
+    mov ah, 0x42                               ; Extended Read Sectors
     int 0x13
 
-    ; Save result in AL (error code from BIOS)
-    mov byte [FLAT(disk_result)], al
+    ; AH holds the status; CF set on error. Record a single byte: 0 on
+    ; success, else the BIOS code (or 1 if only CF told us it failed).
+    mov [DFLAT(disk_result)], ah
     jnc .disk_read_ok
-    mov byte [FLAT(disk_result)], 1            ; If CF set, return error code 1
+    cmp ah, 0
+    jne .disk_read_ok
+    mov byte [DFLAT(disk_result)], 1
 .disk_read_ok:
 
-    ; ---- real mode -> 16-bit protected mode ----
+    ; ---- real mode -> 32-bit protected mode ----
     mov eax, cr0
     or al, 1                           ; set PE
     mov cr0, eax
 
     push dword GDT_CODE32_SEL
-    push dword FLAT(disk_prot32)
+    push dword DFLAT(disk_prot32)
     retfd
 
 bits 32
@@ -442,7 +473,7 @@ disk_prot32:
     mov cr0, eax
 
     push GDT_CODE64_SEL
-    push FLAT(disk_long64)
+    push DFLAT(disk_long64)
     retfd
 
 bits 64
@@ -460,9 +491,13 @@ disk_long64:
     mov rsp, [rel disk_saved_rsp]
     ret
 
+; ---- in-blob data: copied down with the code, reachable from real mode ----
 disk_saved_rsp:
     dq 0
-
+disk_tramp_drive:
+    db 0
+disk_tramp_dapoff:
+    dw 0
 disk_result:
     db 0
 

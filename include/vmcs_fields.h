@@ -25,6 +25,10 @@
 #define HOST_TR_SELECTOR 0x0C0Cu
 
 /* --- 64-bit control fields --- */
+/* IO bitmaps A and B: each is a 4KB page. Bit N set → port N exits.
+ * Bitmap A covers ports 0x0000-0x7FFF; B covers 0x8000-0xFFFF. */
+#define IO_BITMAP_A 0x2000u
+#define IO_BITMAP_B 0x2002u
 #define MSR_BITMAP  0x2004u
 #define EPT_POINTER 0x201Au
 

@@ -25,6 +25,7 @@
 #include "vmexit.h"
 #include "ept.h"
 #include "hooks.h"
+#include "disk.h"
 
 /* CPUID.1:ECX.VMX[bit 5] */
 static int checkForVmxSupport(void) {
@@ -395,6 +396,48 @@ static void interceptMsr(uint8_t *bitmap, uint32_t msr) {
     bitmap[writeBase + index / 8] |= (uint8_t)(1u << (index % 8));
 }
 
+/* ===================================================================
+ * IO bitmap - two 4KB pages covering all 65536 port addresses.
+ * A set bit means "VM exit on any I/O to this port"; a clear bit
+ * passes through to QEMU's emulated hardware.
+ *
+ * We only intercept the three ports that can trigger a hardware CPU
+ * reset, so we see the attempt and can log it before QEMU resets the
+ * machine (which would restart VMBR entirely, hiding the root cause).
+ *   0x64  i8042 keyboard controller - write 0xFE pulses reset line
+ *   0x92  PS/2 System Control Port A - bit 0 (FAST_RESET) resets CPU
+ *   0xCF9 System Reset Control Register - bit 2 triggers reset
+ * Everything else (disk I/O, PIC, PCI, ...) is never intercepted, so
+ * the guest reaches QEMU's emulated devices without any overhead.
+ * =================================================================== */
+#define RESET_PORT_KBC      0x64u   /* i8042 keyboard controller */
+#define RESET_PORT_FAST_A20 0x92u   /* PS/2 System Control Port A */
+#define RESET_PORT_CF9      0xCF9u  /* PCI system reset register */
+
+static void setIoBit(uint8_t *bitmap, uint16_t port) {
+    bitmap[port / 8] |= (uint8_t)(1u << (port % 8));
+}
+
+static int initializeIoBitmap(void) {
+    uint8_t *bitmapA = allocateMemory(PAGE_SIZE); /* ports 0x0000-0x7FFF */
+    uint8_t *bitmapB = allocateMemory(PAGE_SIZE); /* ports 0x8000-0xFFFF */
+    if (!bitmapA || !bitmapB) {
+        logError("couldn't allocate the IO bitmaps!!!\n");
+        return 0;
+    }
+    memset(bitmapA, 0, PAGE_SIZE);
+    memset(bitmapB, 0, PAGE_SIZE);
+
+    setIoBit(bitmapA, RESET_PORT_KBC);
+    setIoBit(bitmapA, RESET_PORT_FAST_A20);
+    setIoBit(bitmapA, RESET_PORT_CF9);
+
+    vmwrite(IO_BITMAP_A, (uint64_t)bitmapA);
+    vmwrite(IO_BITMAP_B, (uint64_t)bitmapB);
+    logInfo("IO bitmap: intercepting reset ports 0x64/0x92/0xCF9\n");
+    return 1;
+}
+
 static int initializeMsrBitmap(void) {
     uint8_t *bitmap = allocateMemory(PAGE_SIZE);
     if (!bitmap) {
@@ -427,7 +470,8 @@ static int initializeControls(uint64_t eptPointer) {
 
     /* adjustControls silently drops any requested bit the CPU doesn't
      * allow, so check the bits EPT depends on actually survived. */
-    uint32_t primaryProcBased = adjustControls(ACTIVATE_SECONDARY_CONTROLS | CPU_BASED_USE_MSR_BITMAPS,
+    uint32_t primaryProcBased = adjustControls(
+        ACTIVATE_SECONDARY_CONTROLS | CPU_BASED_USE_MSR_BITMAPS | CPU_BASED_USE_IO_BITMAPS,
         trueControls ? IA32_VMX_TRUE_PROCBASED_CTLS_MSR : IA32_VMX_PROCBASED_CTLS_MSR);
     if (!(primaryProcBased & ACTIVATE_SECONDARY_CONTROLS)) {
         logError("CPU doesn't allow secondary controls - can't enable EPT!!!\n");
@@ -468,8 +512,17 @@ static int initializeControls(uint64_t eptPointer) {
     vmwrite(SECONDARY_VM_EXEC_CONTROL, secondaryProcBased);
     vmwrite(EPT_POINTER, eptPointer);
 
+    if (!(primaryProcBased & CPU_BASED_USE_IO_BITMAPS)) {
+        logError("CPU doesn't allow IO bitmaps - reset ports unprotected\n");
+    }
+
     if (!initializeMsrBitmap()) {
         return 0;
+    }
+    if (primaryProcBased & CPU_BASED_USE_IO_BITMAPS) {
+        if (!initializeIoBitmap()) {
+            return 0;
+        }
     }
 
     /* HOST_ADDR_SPACE_SIZE is required: the host is running in 64-bit
@@ -512,7 +565,10 @@ static int initializeControls(uint64_t eptPointer) {
     vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE);
     vmwrite(CR3_TARGET_COUNT, 0);
 
-    vmwrite(EXCEPTION_BITMAP, 0); /* don't intercept any exceptions yet */
+    /* Don't intercept guest exceptions - bootmgr handles its own #GP/#PF
+     * via the IDT it just installed. We still get TRIPLE_FAULT via the
+     * reserved exit reason if the guest's own IDT can't rescue it. */
+    vmwrite(EXCEPTION_BITMAP, 0);
     vmwrite(VM_EXIT_MSR_STORE_COUNT, 0);
     vmwrite(VM_EXIT_MSR_LOAD_COUNT, 0);
     vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 0);
@@ -544,12 +600,23 @@ static int initializeVmcs(uint64_t eptPointer) {
  * readable from VM_INSTRUCTION_ERROR now that there IS a current
  * VMCS to read it from (unlike VMXON's failure mode earlier, which
  * had no such field available yet). */
-static void vmlaunch(void) {
+static void vmlaunch(uint8_t bootDrive) {
     uint64_t rflags;
-    __asm__ volatile("vmlaunch\n\t"
+    uint64_t drive = bootDrive;
+    /* The guest's general-purpose registers are NOT part of the VMCS: on
+     * the first entry the guest simply inherits whatever the physical
+     * registers hold at vmlaunch. Loading RDX here therefore sets the
+     * guest's initial RDX, whose low byte (DL) is the BIOS boot-drive
+     * number every MBR reads to know which disk it booted from. If
+     * vmlaunch succeeds control never returns here, so the guest starts
+     * with DL already correct. */
+    __asm__ volatile("mov %1, %%rdx\n\t"
+                      "vmlaunch\n\t"
                       "pushfq\n\t"
                       "pop %0"
-                      : "=r"(rflags));
+                      : "=r"(rflags)
+                      : "r"(drive)
+                      : "rdx", "cc", "memory");
     if (rflags & CARRY_FLAG_MASK) {
         logError("vmlaunch failed: VMfailInvalid\n");
         dumpVmcsState();
@@ -560,6 +627,14 @@ static void vmlaunch(void) {
 }
 
 void InitializeVmm(void) {
+    /* Find the boot disk and load its MBR to 0x7C00 BEFORE touching VMX.
+     * disk_find_bootable_drive() reaches the disk through a BIOS int 0x13
+     * round trip, which clears CR0.PE to drop to real mode - and VMX
+     * operation forbids that (CR0.PE is forced to 1 once VMXON runs). So
+     * all the disk work has to happen here, while we're still ordinary
+     * host code. The MBR then sits untouched at 0x7C00 until launch. */
+    uint8_t bootDrive = disk_find_bootable_drive();
+
     logSection("VMX");
 
     if (!checkForVmxSupport()) {
@@ -612,7 +687,24 @@ void InitializeVmm(void) {
     }
 
     logSection("Guest");
-    copyRealModeGuest();
+    if (bootDrive != 0) {
+        /* A bootable disk was found and its MBR is already sitting at
+         * 0x7C00. Point the guest there instead of at the built-in test
+         * payload: CS base 0, IP 0x7C00 (physical 0x7C00), which is the
+         * entry point a PC MBR is loaded and jumped to by convention.
+         * initializeGuestState() left CS=0x0700/IP=0 for the test guest;
+         * override just those here. */
+        writeRealModeSegment(GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR_BYTES,
+                             0, REAL_MODE_CODE_AR);
+        vmwrite(GUEST_RIP, MBR_LOAD_ADDRESS);
+        logInfo("Booting disk 0x%x: guest entry at 0000:%x (DL=0x%x)\n",
+                bootDrive, MBR_LOAD_ADDRESS, bootDrive);
+    } else {
+        /* No bootable disk - fall back to the built-in real-mode guest so
+         * the VMX path is still exercised. CS/IP already point at it. */
+        logInfo("No bootable disk - launching built-in test guest\n");
+        copyRealModeGuest();
+    }
 
     /* Everything the VMM owns has been allocated by now, so the
      * reserved ranges are final - install the E820 hook that hides
@@ -620,6 +712,18 @@ void InitializeVmm(void) {
      * stub lands just above it) and before launch. */
     installGuestHooks();
 
+    /* Telling the guest's E820 "reserved" isn't enough - Windows's VBR
+     * and bootmgr both ignore the map in their early path and write
+     * straight into low memory. Strip R/W/X on the EPT entries covering
+     * every VMM range so a guest access there exits instead of silently
+     * corrupting us. Must run after the last allocateMemory call, so the
+     * footprint is final; we're still pre-vmlaunch so no INVEPT needed. */
+    MemoryRange protect[VMM_MAX_RESERVED_RANGES];
+    int protectCount = getVmmReservedRanges(protect, VMM_MAX_RESERVED_RANGES);
+    for (int i = 0; i < protectCount; i++) {
+        hideEptRange(eptPml4, protect[i].base, protect[i].end);
+    }
+
     logInfo("Guest is launching...\n");
-    vmlaunch();
+    vmlaunch(bootDrive);
 }

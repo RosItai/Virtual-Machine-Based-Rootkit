@@ -9,6 +9,7 @@
 #include "vmx.h"
 #include "host_paging.h"
 #include "colors.h"
+#include "disk.h"
 
 /* --- Serial port (COM1) I/O --- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -181,6 +182,11 @@ void kernel_main(void) {
     MemoryMapTable *memoryMap = (MemoryMapTable *)MEMORY_MAP_TABLE_ADDR;
     logSection("BIOS E820 Memory Map");
     logInfo("%lu entries loaded\n", (unsigned long)memoryMap->numberOfEntries);
+
+    /* Disk driver bring-up: announces itself and probes the first HDD
+     * via a BIOS int 0x13 round trip (same trampoline mechanism the
+     * E820 call above already proved works). */
+    disk_init();
 
     /* Before InitializeVmm: HOST_CR3 is taken from the live CR3, so the
      * VMCS picks up the new tables automatically. */

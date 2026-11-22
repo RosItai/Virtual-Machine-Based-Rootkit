@@ -1,8 +1,13 @@
 /* linker.ld
  * Controls where each piece of the kernel ends up in memory.
  * Two things matter for Multiboot2 to work:
- *   1. The kernel loads at 1MB (0x100000) - the traditional safe spot,
- *      below memory holes and above the BIOS/boot area.
+ *   1. The kernel loads at 256MB (0x10000000) - traditional 1MB is where
+ *      Windows's bootmgr and winload hard-code their own loader data
+ *      regardless of E820 reservations, so VMBR living there gets
+ *      overwritten the moment bootmgr starts (verified: a Windows guest
+ *      EPT-violated on a write to 0x100000 right after entering
+ *      protected mode). 256MB is above the Windows BOOT phase's working
+ *      set and well below the ~3GB region allocateMemory uses.
  *   2. The .multiboot_header section comes first in the file, so it's
  *      guaranteed to be within the first 32KB GRUB scans.
  */
@@ -10,7 +15,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 1M;
+    . = 0x10000000;
 
     /* The kernel image's own bounds, for the memory the VMM has to
      * protect from the guest: everything between these two symbols is

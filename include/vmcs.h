@@ -196,6 +196,14 @@
 #define SEG_FLAG_G    (1u << 15)  /* Granularity */
 #define SEG_UNUSABLE  (1u << 16)  /* VMX-specific: segment not in use */
 
+/* --- Exit qualification layout for EXIT_REASON_IO_INSTRUCTION --- *
+ * SDM Vol 3C, Table 27-5.                                          */
+#define IO_ACCESS_SIZE(q)      ((uint32_t)((q) & 0x7u))           /* 0=1B, 1=2B, 3=4B */
+#define IO_ACCESS_IS_IN(q)     (((q) >> 3) & 0x1u)                /* 1=IN, 0=OUT */
+#define IO_ACCESS_IS_STRING(q) (((q) >> 4) & 0x1u)
+#define IO_ACCESS_HAS_REP(q)   (((q) >> 5) & 0x1u)
+#define IO_ACCESS_PORT(q)      ((uint16_t)(((q) >> 16) & 0xFFFFu))
+
 /* --- Exit qualification layout for EXIT_REASON_CR_ACCESS --- */
 #define CR_ACCESS_CR_NUMBER(qualification)  ((uint32_t)((qualification) & 0xFu))
 #define CR_ACCESS_TYPE(qualification)       ((uint32_t)(((qualification) >> 4) & 0x3u))

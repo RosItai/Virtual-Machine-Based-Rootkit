@@ -17,6 +17,10 @@
  * still gets a #UD). "VMBR" as four ASCII bytes. */
 #define VMBR_HYPERCALL_MAGIC 0x564D4252u
 
+/* The INT 13h (disk) hook stub uses its own marker, "VMBD", so the host
+ * dispatches it to the disk observer instead of the E820 service. */
+#define VMBR_DISK_HYPERCALL_MAGIC 0x564D4244u
+
 /* Builds the filtered E820 map the guest will see (the real map with
  * the VMM's ranges carved out as reserved) and splices the INT 15h
  * hook stub into the guest's IVT. Call once, after every allocation is
