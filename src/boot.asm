@@ -51,12 +51,29 @@ extern load_gdt
 extern enter_long_mode
 
 _start:
-    mov esp, stack_top   ; set up a stack (stacks grow downward, so esp
-                          ; starts at the top of the region we reserved)
+    ; ---- BSP vs AP split ----
+    ; All cores land here (the WSL2/KVM setup lets APs run from GRUB
+    ; without waiting for a SIPI, unlike bare metal where firmware
+    ; leaves them in wait-for-SIPI). IA32_APIC_BASE (MSR 0x1B) bit 8
+    ; is the BSP flag: set on the bootstrap processor, clear on every
+    ; AP. Only the BSP installs the GDT and builds the page tables;
+    ; APs spin until that's done, then grab their own stack and join.
+    mov ecx, 0x1B
+    rdmsr
+    test eax, 1 << 8
+    jz .ap_entry
+
+    ; ---- BSP path ----
+    mov esp, stack_top   ; dedicated BSP stack
 
     call load_gdt          ; take ownership of the GDT (see gdt.asm)
     call setup_paging      ; build PML4/PDPT/PD tables (see paging.asm) -
                            ; doesn't touch CR0/CR3/CR4/EFER yet
+
+    ; With the GDT and page tables in place, APs can safely enter long
+    ; mode too - the paging tables stay read-only from here on, so no
+    ; race with the APs loading CR3 off them. Release the APs.
+    mov dword [bsp_ready], 1
 
     call enter_long_mode    ; flips on PAE/CR3/LME/PG and far-jumps into
                             ; 64-bit code (long_mode.asm) - never returns
@@ -66,8 +83,60 @@ _start:
     hlt
     jmp .hang
 
+    ; ---- AP path ----
+    ; APs cannot touch any shared boot state until the BSP's GDT and
+    ; paging are in place. Spin on bsp_ready with `pause` to be gentle
+    ; on the fetch unit (hyperthread hint that we're in a busy wait).
+.ap_entry:
+.ap_wait:
+    pause
+    cmp dword [bsp_ready], 0
+    je .ap_wait
+
+    ; Claim a per-AP stack slot. `lock xadd` is the architectural way
+    ; to read-modify-write a shared counter atomically across cores:
+    ; eax ends up with the pre-increment value (0, 1, 2, ...), which
+    ; is our AP index. Each AP's stack is AP_STACK_SIZE bytes wide,
+    ; laid out back to back in ap_stacks; the stack grows down from
+    ; the TOP of our slot, i.e. (index + 1) * AP_STACK_SIZE bytes in.
+    mov eax, 1
+    lock xadd [ap_counter], eax
+    inc eax
+    shl eax, 14                 ; * AP_STACK_SIZE (16384)
+    mov esp, ap_stacks
+    add esp, eax
+
+    call load_gdt               ; load the shared GDT pointer - idempotent
+    call enter_long_mode        ; same transition as BSP; long_mode_entry
+                                ; re-checks the BSP bit to split paths
+                                ; back apart once 64-bit code starts.
+
+section .data
+align 4
+; BSP releases the APs by writing 1 here. 0 means "wait" - the initial
+; state is 0 (BSS clears to 0, but we keep it explicit in .data).
+global bsp_ready
+bsp_ready:
+    dd 0
+
+; Atomic counter the APs lock-xadd to pick a unique slot in ap_stacks.
+; Lives in .data only because .bss' zero-init is enough here anyway and
+; co-locating these two clarifies the handshake. Exposed to C so the
+; BSP side can tell (after boot) whether any APs ever joined.
+global ap_counter
+ap_counter:
+    dd 0
+
 section .bss
 align 16
 stack_bottom:
-    resb 16384            ; 16KB stack
+    resb 16384            ; 16KB BSP stack
 stack_top:
+
+align 16
+; Per-AP stacks, 16KB each, back to back. Sized for MAX_APS cores -
+; raise it if VMBR ever runs with more.
+AP_STACK_SIZE equ 16384
+MAX_APS       equ 8
+ap_stacks:
+    resb AP_STACK_SIZE * MAX_APS

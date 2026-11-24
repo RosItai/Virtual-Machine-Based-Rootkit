@@ -18,3 +18,14 @@ void *memcpy(void *dest, const void *src, size_t count) {
     }
     return dest;
 }
+
+int memcmp(const void *a, const void *b, size_t count) {
+    const unsigned char *pa = (const unsigned char *)a;
+    const unsigned char *pb = (const unsigned char *)b;
+    for (size_t i = 0; i < count; i++) {
+        if (pa[i] != pb[i]) {
+            return (int)pa[i] - (int)pb[i];
+        }
+    }
+    return 0;
+}

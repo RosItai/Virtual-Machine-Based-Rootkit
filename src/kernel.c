@@ -10,6 +10,8 @@
 #include "host_paging.h"
 #include "colors.h"
 #include "disk.h"
+#include "acpi.h"
+#include "smp.h"
 
 /* --- Serial port (COM1) I/O --- */
 static inline void outb(uint16_t port, uint8_t val) {
@@ -187,6 +189,25 @@ void kernel_main(void) {
      * via a BIOS int 0x13 round trip (same trampoline mechanism the
      * E820 call above already proved works). */
     disk_init();
+
+    /* Firmware ACPI tables - the only way to find out how many CPUs the
+     * machine actually has (the MADT lists one Local APIC entry per
+     * logical CPU). Needed for the SMP bring-up that follows. */
+    logSection("ACPI");
+    int cpuCount = countCpus();
+    if (cpuCount == 0) {
+        logError("falling back to 1 CPU - SMP disabled\n");
+        cpuCount = 1;
+    }
+
+    /* Wake the APs that SeaBIOS left in wait-for-SIPI. Phase-A: each
+     * AP arrives at the trampoline and HLTs; the arrival counter tells
+     * us whether INIT-SIPI landed. Later phases turn the trampoline
+     * into a full long-mode entry that calls ap_main. */
+    if (cpuCount > 1) {
+        logSection("SMP");
+        wakeAps(cpuCount);
+    }
 
     /* Before InitializeVmm: HOST_CR3 is taken from the live CR3, so the
      * VMCS picks up the new tables automatically. */

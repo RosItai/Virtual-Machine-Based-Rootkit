@@ -39,7 +39,49 @@ echo
 
 # --- sanity checks ---
 if [ ! -f "$ISO" ]; then
-    echo "ERROR: install ISO not found: $ISO" >&2
+    cat >&2 <<EOF
+ERROR: Windows install ISO not found at: $ISO
+
+Microsoft does not permit third-party redistribution of Windows media,
+so this repository ships no ISO. Download one yourself (free, legal)
+from the official Microsoft page and drop it in place:
+
+  1. Open in a web browser:
+
+       https://www.microsoft.com/en-us/software-download/windows10ISO
+
+  2. The page checks your User-Agent and branches:
+
+       - On Linux / macOS: it shows "Download Windows 10 Disk Image
+         (ISO)" dropdowns directly.
+       - On Windows: it hides the ISO option and offers only the Media
+         Creation Tool. Work around it either by opening the same URL
+         from your browser's mobile-device emulation (DevTools ->
+         "Toggle device toolbar" in Chrome/Edge, "Responsive Design
+         Mode" in Firefox), or by running Microsoft's own
+         MediaCreationTool22H2.exe and choosing
+         "Create installation media for another PC" -> "ISO file".
+
+  3. Pick in the download page:
+
+       - Edition : "Windows 10 (multi-edition ISO)"
+       - Language: your language
+       - Arch    : 64-bit  (file is ~5-6 GB)
+
+  4. Save the downloaded file as EXACTLY this path:
+
+       $ISO
+
+     (Create the containing folder if it doesn't exist:
+        mkdir -p "$(dirname -- "$ISO")"
+     )
+
+  5. Re-run this script. It'll pick up the ISO automatically and
+     start the installer in plain QEMU (no VMBR yet).
+
+You can also point the script at a different ISO location with:
+    ISO=/some/other/path/Windows.iso tools/install_windows.sh
+EOF
     exit 1
 fi
 

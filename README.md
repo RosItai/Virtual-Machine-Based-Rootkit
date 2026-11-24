@@ -183,6 +183,54 @@ host's `kvm_intel`/`kvm_amd` reporting `nested: Y`.
 
 ---
 
+## Running with a Windows guest
+
+By default `make run` boots the small built-in real-mode test guest (see
+`src/guest.asm`). To run **Windows 10** as the guest instead, you need a
+bootable Windows disk image. VMBR doesn't ship one: the image is multi-GB
+and the Windows media is Microsoft's to distribute, not ours. Each user
+installs their own with the helper script.
+
+```bash
+# 1. Point the helper at a fresh ISO (see below) and let it install
+#    Windows into a qcow2 disk in plain QEMU (no VMBR yet):
+tools/install_windows.sh
+# ...click through the installer, reach the desktop, shut Windows
+# down from inside the VM, then close QEMU.
+
+# 2. Boot that installed disk UNDER VMBR:
+make run     DISK_IMG=Win10/win10.qcow2 DISK_FMT=qcow2 MEM=8G
+make run-gui DISK_IMG=Win10/win10.qcow2 DISK_FMT=qcow2 MEM=8G SMP=4
+```
+
+The script creates `Win10/win10.qcow2` (~40 GB sparse, grows on demand)
+and expects a Windows install ISO at `Win10/Windows.iso`. Both paths are
+in the project's `.gitignore` - they stay on your machine only.
+
+### Getting the Windows 10 ISO legally and for free
+
+Microsoft publishes a direct ISO download on its official site. The
+page's behaviour depends on the browser's User-Agent:
+
+1. **Linux / macOS**: open <https://www.microsoft.com/en-us/software-download/windows10ISO>
+   and you'll see the "Download Windows 10 Disk Image (ISO)" dropdowns.
+2. **Windows**: the same page hides the ISO option and pushes the Media
+   Creation Tool at you. Two workarounds:
+   - Open the URL in your browser's mobile-device emulation (Chrome/Edge
+     DevTools → *Toggle device toolbar*; Firefox → *Responsive Design
+     Mode*) — the page then shows the Linux-style dropdowns.
+   - Or download `MediaCreationTool22H2.exe` from the same page, run it,
+     pick *"Create installation media (ISO file)"*, and save the result.
+3. In the dropdowns pick **"Windows 10 (multi-edition ISO)"** → confirm
+   → your language → confirm → click **64-bit Download**. The file is
+   ~5-6 GB.
+4. Save it as `Win10/Windows.iso` in this repo (create the folder first:
+   `mkdir -p Win10`). Then re-run `tools/install_windows.sh`.
+
+The install script also prints these steps if the ISO is missing.
+
+---
+
 ## Project layout
 
 ```

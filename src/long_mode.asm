@@ -71,6 +71,7 @@ section .text
 ; ---------------------------------------------------------------------
 extern bios_load_memory_map
 extern kernel_main
+extern ap_main
 
 bits 64
 long_mode_entry:
@@ -96,6 +97,14 @@ long_mode_entry:
     ; past this point, so a plain realign is enough.
     and rsp, -16
 
+    ; BSP vs AP split (again - in long mode this time). Only the BSP
+    ; calls the BIOS E820 round trip and kernel_main; APs took their
+    ; own stack back in boot.asm and go straight into ap_main.
+    mov ecx, 0x1B
+    rdmsr
+    test eax, 1 << 8
+    jz .ap_long_mode
+
     lea rsi, [rel msg_ok]
     call serial_print64
 
@@ -111,6 +120,10 @@ long_mode_entry:
     call bios_load_memory_map
 
     call kernel_main
+    jmp .hang
+
+.ap_long_mode:
+    call ap_main
 
 .hang:
     hlt

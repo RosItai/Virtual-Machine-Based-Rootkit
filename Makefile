@@ -100,9 +100,12 @@ build: build/vmbr.iso
 DISK_IMG ?= test_disk.img
 DISK_FMT ?= raw
 MEM      ?= 2G
+# SMP: still defaults to 1 until boot.asm parks APs (see the comment on
+# the debug target). Raise it to exercise ACPI MADT CPU detection.
+SMP      ?= 1
 
 run: build
-	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp 1 -enable-kvm -cpu host -machine smm=off -nographic -no-reboot -d cpu_reset 2>&1 | tee /tmp/vmbr_last_run.log
+	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp $(SMP) -enable-kvm -cpu host -machine smm=off -nographic -no-reboot -d cpu_reset 2>&1 | tee /tmp/vmbr_last_run.log
 
 # Like `run`, but with the VGA window open so the guest's screen is visible
 # alongside VMBR's serial log. Useful when the guest halts silently - any
@@ -112,7 +115,7 @@ run: build
 # buffered the file and lost every pre-crash byte); the tee below also
 # saves a copy for later.
 run-gui: build
-	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp 1 -enable-kvm -cpu host -machine smm=off -serial stdio -no-reboot -usb -device usb-tablet -device usb-kbd -display gtk -d cpu_reset 2>&1 | tee /tmp/vmbr_last_run.log
+	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp $(SMP) -enable-kvm -cpu host -machine smm=off -serial stdio -no-reboot -usb -device usb-tablet -device usb-kbd -display gtk -d cpu_reset 2>&1 | tee /tmp/vmbr_last_run.log
 
 # "debug" boots QEMU paused (-S) with a GDB stub open on port 1234 (-s),
 # for use once you've got debug utilities and want to attach GDB/GEF:
@@ -123,7 +126,7 @@ run-gui: build
 # confirmed via gdb (3 of 4 threads halted at the identical garbage
 # address). Revisit once boot.asm parks APs deliberately.
 debug: build
-	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp 1 -enable-kvm -cpu host -machine smm=off -s -S -nographic -no-reboot
+	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp $(SMP) -enable-kvm -cpu host -machine smm=off -s -S -nographic -no-reboot
 
 build/%.o: src/%.c
 	@mkdir -p build

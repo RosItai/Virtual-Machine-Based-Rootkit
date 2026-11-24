@@ -3,3 +3,13 @@ build/
 
 # Visual Studio local cache
 .vs/
+
+# Claude Code local settings
+.claude/
+
+# Windows install assets - these are large (tens of GB) and user-specific.
+# Each user downloads/installs their own via tools/install_windows.sh;
+# see the README for the usage flow.
+Win10/
+*.qcow2
+*.iso
