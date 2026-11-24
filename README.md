@@ -14,7 +14,7 @@
 ![arch](https://img.shields.io/badge/arch-x86__64-informational)
 ![tech](https://img.shields.io/badge/Intel-VT--x%20%2F%20EPT-0071C5?logo=intel&logoColor=white)
 ![freestanding](https://img.shields.io/badge/libc-none%20(freestanding)-critical)
-![status](https://img.shields.io/badge/status-boots%20a%20guest-success)
+![status](https://img.shields.io/badge/status-boots%20Windows%2010-success)
 
 **VMBR** is a bare-metal **Type-1 hypervisor** — it isn't a program that runs *on* an
 OS, it *is* the thing the CPU boots into, and everything else runs as its guest. It
@@ -25,14 +25,15 @@ a guest that it fully controls through VM exits.
 No libc, no RTOS, no framework. Just C and x86 assembly talking to the hardware
 directly, built one iteration at a time against the Intel SDM.
 
-> **End goal:** boot Windows as the guest and protect the hypervisor's own memory
-> from it using EPT. Everything below is the road there.
+> **Current state:** boots Windows 10 all the way to the sign-in screen and desktop,
+> on a single CPU, with the hypervisor's own memory protected from the guest at the
+> EPT layer. SMP bring-up for the guest is in progress.
 
-![VMBR booting a guest and servicing its VM exits](docs/screenshot.png)
+![Windows 10 running as a VMBR guest, with the hypervisor's serial log on the left](docs/images/windows-guest.png)
 
-*The full boot chain reporting in over the serial console — ending with the guest
-running inside the VM and reading the (hooked) memory map, the hypervisor's own pages
-shown as `reserved`.*
+*Windows 10 desktop running inside VMBR (right) while the hypervisor logs every port
+I/O the guest performs over its serial console (left). Everything the guest does
+goes through a VM exit the hypervisor handles.*
 
 ---
 
@@ -43,21 +44,28 @@ place where getting one bit wrong triple-faults the machine with no debugger to 
 
 ```
  GRUB (Multiboot2)
-      │  loads the kernel at 1 MB, 32-bit protected mode
+      │  loads the kernel at 256 MB, 32-bit protected mode
       ▼
- _start (boot.asm) ──► paging (4 GB identity) ──► GDT ──► enter long mode
+ _start (boot.asm) ──► BSP vs AP split (IA32_APIC_BASE bit 8)
+      │
+      │                          ┌─── APs: wait on bsp_ready, grab own stack ──┐
+      ▼                          ▼                                              │
+ BSP: paging (8 GB identity) ──► GDT ──► enter long mode ◄──────────────────────┘
       │                                                        │
       │                              far-jump into 64-bit code ▼
-      ▼                                               kernel_main (C)
+      ▼                                     kernel_main (C) / ap_main (C)
  BIOS E820 map  ◄── long-mode→real-mode trampoline (bios_call.asm)
       │
       ▼
- bump allocator ──► host paging rebuilt ──► VMXON ──► VMCS ──► EPT (identity, MTRR-typed)
-      │                                                               │
-      ▼                                                               ▼
- install E820 hook ──────────────────────────────► VMLAUNCH ──► 🫥 guest runs
+ ACPI → MADT → CPU count ──► Local APIC INIT-SIPI wakes the APs that firmware parked
+      │
+      ▼
+ bump allocator ──► host paging rebuilt (8 GB) ──► VMXON ──► VMCS ──► EPT (identity,
+      │                                                                 MTRR-typed,
+      ▼                                                                 VMM pages hidden)
+ install guest hooks (E820, INT 13h, INT 15h) ──► VMLAUNCH ──► 🫥 guest runs (Windows 10)
                                                                       │
-                                   every CPUID / MSR / CR / VMCALL ───┤
+                               every CPUID / MSR / CR / VMCALL / port I/O ─┤
                                                                       ▼
                                               VM-exit handler ──► VMRESUME ──► … 
 ```
@@ -156,9 +164,50 @@ guest E820 map built: 8 entries (2 VMM ranges carved out as reserved)
 
 ### 4. EPT, typed from the real MTRRs
 
-A second layer of page tables (`ept.c`) identity-maps the first 4 GB for the guest at
+A second layer of page tables (`ept.c`) identity-maps the first 8 GB for the guest at
 4 KB granularity, and sets each page's memory type from the host's MTRRs — so guest RAM
 stays write-back while the VGA/APIC/PCI holes stay uncacheable, instead of guessing.
+
+### 5. Hiding the hypervisor's own pages at the EPT layer
+
+The E820 hook asks the guest to be polite — "please don't use this memory." Windows
+doesn't listen. Its `bootmgr` and `winload` hard-code specific physical addresses as
+loader scratch and write to them regardless of what the E820 says, which used to
+silently corrupt VMBR itself (the next VM exit then ran on scrambled host code and
+nested KVM didn't forward the resulting triple fault back to us — QEMU just exited
+with nothing in the log).
+
+Enforcement had to move down a layer: before `VMLAUNCH`, `hideEptRange()` walks the
+EPT for every VMM-owned range (kernel image, allocator footprint) and clears
+`read`/`write`/`execute` on each PTE. The guest can still *see* those guest-physical
+addresses in its own page tables, but the moment it dereferences one the CPU raises
+an EPT violation and exits straight to us with the faulting address.
+
+```c
+// src/ept.c — hideEptRange(): make VMM memory unmappable to the guest
+for (uint64_t addr = pageStart; addr < pageEnd; addr += PAGE_SIZE) {
+    EptPageEntry *pte = /* walk PML4 → PDPT → PD → PT */ ... ;
+    pte->fields.read    = 0;
+    pte->fields.write   = 0;
+    pte->fields.execute = 0;
+}
+```
+
+Plus, the kernel was relinked at **256 MB** (`src/linker_script.ld`) — out of the
+1 MB neighbourhood every Windows loader hard-codes as its own.
+
+### 6. Observing the firmware boot chain through an `INT 13h` hook
+
+VMBR can't service `INT 13h` disk reads itself once `VMXON` is running (reaching
+real mode needs `CR0.PE=0`, which VMX operation forbids), so the hook is an
+**observe-and-chain** stub: on every guest `INT 13h`, bounce into the host with a
+`VMCALL` carrying a disk-specific magic, let the host log the LBA/count/buffer the
+guest asked for, and then jump straight to the original BIOS handler the IVT held
+before the hook was installed.
+
+That's how the serial log in the screenshot above shows every sector the guest
+reads during the whole boot chain — MBR, VBR, MFT, `bootmgr`, `winload.exe`,
+`ntoskrnl` — without the hypervisor ever actually servicing the disk.
 
 ---
 
@@ -235,10 +284,10 @@ The install script also prints these steps if the ISO is missing.
 
 ```
 src/
-  boot.asm            Multiboot2 header + _start (32-bit entry)
-  paging.asm          4 GB identity page tables
-  gdt.asm             flat GDT with 16/32/64-bit descriptors
-  long_mode.asm       the actual switch into 64-bit mode
+  boot.asm            Multiboot2 header + _start; BSP vs AP split
+  paging.asm          8 GB identity page tables (host, boot-time)
+  gdt.asm             flat GDT with 16/32/64-bit descriptors + TSS
+  long_mode.asm       the switch into 64-bit mode (BSP / AP branches)
   bios_call.asm       long-mode → real-mode trampoline (for BIOS INT calls)
   memory_map.asm      BIOS E820 loader
   kernel.c            kernel_main — boots the VMM
@@ -246,36 +295,64 @@ src/
   host_paging.c       rebuilds host page tables and switches CR3
   vmx.c               VMXON, VMCS setup, EPT wiring, VMLAUNCH
   vmcs_fields.h       VMCS field encodings (SDM Appendix B)
-  ept.c               identity EPT, memory types from the MTRRs
+  ept.c               identity EPT (8 GB), memory types from the MTRRs,
+                      per-page R/W/X hiding of the VMM's own range
   vmexit_entry.asm    the VM-exit stub (saves guest state, resumes)
   vmexit.c            VM-exit dispatcher + per-reason handlers
-  hooks.c             guest-facing hooks (the E820 memory hook)
-  int15_hook.asm      real-mode stub spliced into the guest's IVT
-  guest.asm           the real-mode test guest
+  hooks.c             guest-facing hooks (E820 and INT 13h observers)
+  int15_hook.asm      real-mode stub spliced into the guest's IVT (INT 15h)
+  int13_hook.asm      observe-and-chain INT 13h hook (disk access)
+  disk.c              high-level BIOS int 0x13 driver (DAP, bounce buffer)
+  acpi.c              RSDP → RSDT/XSDT → MADT CPU count
+  smp.c               Local APIC INIT-SIPI-SIPI to wake the APs
+  ap_trampoline.asm   the real-mode stub each AP wakes up into
+  ap.c                ap_main — per-AP long-mode entry
+  guest.asm           the real-mode test guest (used when no disk is given)
 include/              the matching headers
+tools/
+  install_windows.sh  install Windows into a qcow2 disk in plain QEMU
 ```
 
 ---
 
 ## Status & roadmap
 
-**Working today** — boots a real-mode guest under full VMX, and services its exits:
+**Working today** — boots **Windows 10** as the guest, on a single CPU, with the
+hypervisor's own memory inaccessible to it:
 
 - [x] Multiboot2 / GRUB / QEMU boot chain
-- [x] Paging, GDT, long mode, BIOS E820, bump allocator
-- [x] `VMXON` → `VMCS` → `EPT` (MTRR-typed) → unrestricted guest → `VMLAUNCH`
+- [x] 8 GB-covering paging, GDT, long mode, BIOS E820, bump allocator
+- [x] `VMXON` → `VMCS` → `EPT` (MTRR-typed, 8 GB) → unrestricted guest → `VMLAUNCH`
 - [x] VM-exit framework: `CPUID`, `RDMSR`/`WRMSR` (MSR bitmap), `MOV CR`, `INVD`,
       `XSETBV`, `GETSEC`/`RSM`, all VMX instructions → `#UD`
 - [x] Guest mode-switch tracking (real → protected → long) via the CR0/EFER exits
 - [x] `INT 15h`/E820 memory hook over `VMCALL` — the VMM hides its own memory
+- [x] Real BIOS `INT 13h` disk driver, MBR scan, guest booted from the found MBR
+- [x] `INT 13h` observe-and-chain hook — every guest disk access logged
+- [x] Three reset-capable I/O ports (`0x64`, `0x92`, `0xCF9`) trapped so the guest
+      can't just restart the machine out from under us
+- [x] VMBR's own pages hidden from the guest at the EPT layer — a Windows write to
+      the kernel range exits as an EPT violation instead of silently corrupting us
+- [x] Windows 10 boots to the sign-in screen and the desktop on a single CPU
+- [x] ACPI table walk (RSDP → RSDT / XSDT → MADT) — knows how many CPUs there are
+- [x] Local APIC `INIT`-`SIPI`-`SIPI` wake-up — all APs reach a shared
+      low-memory trampoline (phase A of iteration 8)
 
-**Next**
+**In progress — Iteration 8: SMP**
 
-- [ ] Remove the VMM's pages from the EPT — real enforcement (E820 only stops the
-      guest *choosing* that memory; EPT stops it *touching* it)
+- [ ] AP trampoline does the full real → protected → long-mode transition into
+      `ap_main` (phase B)
+- [ ] Each AP does its own `VMXON` + `VMCS` with the initial guest state the
+      SDM specifies for a non-BSP CPU (phase B)
+- [ ] `INIT`/`SIPI` VM-exit handlers so Windows waking its own APs is translated
+      into VMBR waking the AP's guest VMCS (phases C/D)
+- [ ] Windows seeing (and using) every logical CPU the host reports
+
+**Beyond iteration 8**
+
 - [ ] Re-inject an event interrupted mid-delivery (`IDT_VECTORING_INFO`)
-- [ ] Boot a real guest OS → Windows
-- [ ] Park the non-BSP cores (deferred until Windows boots)
+- [ ] x2APIC virtualization (MSR-based APIC) for the guest
+- [ ] Nest VMBR inside itself — guest hypervisor support
 
 ---
 
@@ -296,6 +373,36 @@ cost hours and none showed up where you'd look:
   32→64-bit `call` that never returns skews `RSP` by 4 bytes; the SysV ABI's 16-byte
   alignment requirement does the rest. (It's why `and rsp, -16` guards every C call
   from assembly.)
+- **The bump allocator triple-faulting right after `== Host Paging ==`** — with
+  QEMU `-m 4G` (or more) the E820 ends with a usable region *above* 4 GB, which
+  the "last usable wins" picker happily chose. The boot page tables map only the
+  first 4 GB, so the first `memset()` on that allocation faulted through a
+  never-mapped PDE. Fix: `ALLOC_LIMIT` clamps every region to the paging ceiling.
+- **A Windows guest silently hanging right after it read LBA 2050** — our INT 13h
+  observe stub lived at 0x8000-0x81FF, and Windows's NTFS VBR is 16 sectors
+  loaded contiguously at 0x7C00, so LBA 2050 lands exactly on the stub. The IVT
+  still pointed there, so the next `int 13h` jumped into random VBR bytes and
+  the guest just stopped making progress. Moved the stubs to 0x9F000 (above the
+  VBR's reach, below SeaBIOS's EBDA) and marked the page reserved in the guest E820.
+- **Windows booting almost all the way through protected mode and then QEMU
+  just exiting, no VM-exit, no triple-fault, nothing in the log** — Windows's
+  bootmgr and winload hard-code 0x100000 as their own loader scratch and write
+  there regardless of what the E820 says. The hypervisor used to *link* at 1 MB,
+  so the first write corrupted VMBR's own code, the next VM exit ran on
+  garbage, and nested KVM didn't forward the resulting triple fault back to us.
+  Moved VMBR to 256 MB and now unmap its pages from the EPT so Windows gets a
+  legible EPT violation instead of taking us down with it.
+- **`MEM=8G` reproducing the original "silent crash right after Host Paging"** —
+  `setup_paging` in `paging.asm` is 32-bit code that was walking the physical
+  address in `eax` alone, so every 2 MB PDE past the 4 GB boundary wrapped back
+  to 0 and shadow-mapped the first GB. Carry the high 32 bits in `esi`
+  (`adc esi, 0` after each `add eax, LARGE_PAGE_SIZE`) and write them into the
+  high dword of each PDE.
+- **SeaBIOS leaves non-BSP cores in wait-for-SIPI, not running our code** —
+  checking `IA32_APIC_BASE` bit 8 in boot.asm was enough to *park* APs that do
+  reach it, but SeaBIOS never lets them get there. Phase A of iteration 8 copies
+  a real-mode stub to 0x8000 and uses the Local APIC's ICR to deliver
+  `INIT`-`SIPI`-`SIPI` to each AP the ACPI MADT reports.
 
 ---
 
