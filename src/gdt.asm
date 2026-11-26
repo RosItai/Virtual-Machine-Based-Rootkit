@@ -104,6 +104,12 @@ TSS_SIZE equ 104   ; minimal 64-bit TSS (no IST/RSP0 use yet)
     dw .pointer - _gdt - 1   ; GDT limit = size of the table above, minus 1
     dq _gdt                  ; GDT base (8 bytes, so this also works unchanged with a 64-bit lgdt later)
 
+; Total GDT byte count, exported so SMP trampolines can build their own
+; 6-byte GDTR without duplicating the hardcoded value.
+GDT_BYTES equ .pointer - _gdt
+global GDT_BYTES
+global _gdt
+
 ; Selector numbers are just the byte offset into the table (8 bytes per
 ; descriptor, RPL 0), which is exactly what the equ's above computed.
 GDT_CODE64_SEL equ .code64

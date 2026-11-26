@@ -580,8 +580,17 @@ static int initializeControls(uint64_t eptPointer) {
  * goes through writeGuestCr0, which reconciles the IA32e-mode-guest
  * entry control against it, so VM_ENTRY_CONTROLS has to hold a real
  * value by then. */
+/* setupTss() is intentionally NOT called from here - it writes the GDT's
+ * TSS descriptor and executes LTR, both of which are BSP-only work. The
+ * GDT is shared across every CPU, and LTR on a TSS descriptor that's
+ * already marked busy is #GP(0) per the SDM - so three APs racing into
+ * this function and each running LTR on the already-busy descriptor the
+ * BSP left behind triple-faulted the whole machine (no IDT yet). BSP
+ * must call setupTss() itself before invoking this; APs reuse the GDT
+ * slot the BSP configured and only populate their own VMCS HOST_TR_*
+ * fields (initializeHostState below), which VM-exit loads without the
+ * busy-bit check LTR enforces. */
 static int initializeVmcs(uint64_t eptPointer) {
-    setupTss();
     if (!initializeControls(eptPointer)) {
         return 0;
     }
@@ -624,6 +633,101 @@ static void vmlaunch(uint8_t bootDrive) {
         logError("vmlaunch failed: VMfailValid, error code %lu\n", vmread(VM_INSTRUCTION_ERROR));
         dumpVmcsState();
     }
+}
+
+/* --- Cross-CPU handoff for SMP bring-up ---
+ * BSP builds the EPT once and publishes its EPTP here after all host
+ * state is ready. APs wait for ready to flip to 1, then read eptPointer
+ * and build their own per-CPU VMXON/VMCS pointing at the same EPT. */
+static volatile uint64_t apSharedEptPointer = 0;
+static volatile uint32_t apSharedReady = 0;
+
+/* Where the AP guest stub ends up in low memory. 0x9F200 sits in the
+ * HOOK_STUB_PROTECT range the guest E820 already marks reserved, so
+ * Windows won't overwrite it. See hooks.c for the same protection. */
+#define AP_GUEST_STUB_ADDR    0x9F200ull
+#define AP_GUEST_STUB_SEGMENT ((uint16_t)(AP_GUEST_STUB_ADDR >> 4))
+
+/* The AP guest stub itself: cli; hlt; jmp $-1 (loops back to hlt if
+ * an NMI or anything else wakes HLT). Installed by BSP into the slot
+ * above before releasing the APs. 4 bytes. */
+static void installApGuestStub(void) {
+    uint8_t *stub = (uint8_t *)AP_GUEST_STUB_ADDR;
+    stub[0] = 0xFA;             /* cli */
+    stub[1] = 0xF4;             /* hlt */
+    stub[2] = 0xEB;             /* jmp */
+    stub[3] = 0xFD;             /* -3 -> back to hlt */
+}
+
+/* Called by ap_main on each AP after long-mode entry. Mirrors BSP's
+ * VMX bring-up in InitializeVmm, but points its guest state at the
+ * tiny halt stub above instead of the MBR. */
+void apBringUp(void) {
+    /* Wait until BSP has published a usable EPTP. */
+    while (!apSharedReady) {
+        __asm__ volatile("pause");
+    }
+    uint64_t eptPointer = apSharedEptPointer;
+
+    /* Per-CPU VMX enable (CR0/CR4 fixup + feature-control unlock). */
+    if (!enableVmx()) {
+        logError("AP: VMX disabled by firmware\n");
+        for (;;) { __asm__ volatile("cli\n\thlt"); }
+    }
+
+    /* Per-CPU VMXON region. */
+    void *vmxonRegion = allocateMemory(PAGE_SIZE);
+    if (!vmxonRegion) {
+        logError("AP: VMXON region alloc failed\n");
+        for (;;) { __asm__ volatile("cli\n\thlt"); }
+    }
+    prepareVmxRegion(vmxonRegion);
+    if (!vmxon((uint64_t)vmxonRegion)) {
+        logError("AP: VMXON failed\n");
+        for (;;) { __asm__ volatile("cli\n\thlt"); }
+    }
+
+    /* Per-CPU VMCS region. */
+    void *vmcsRegion = allocateMemory(PAGE_SIZE);
+    if (!vmcsRegion) {
+        logError("AP: VMCS region alloc failed\n");
+        for (;;) { __asm__ volatile("cli\n\thlt"); }
+    }
+    prepareVmxRegion(vmcsRegion);
+    vmclear((uint64_t)vmcsRegion);
+    if (!vmptrld((uint64_t)vmcsRegion)) {
+        logError("AP: VMPTRLD failed\n");
+        for (;;) { __asm__ volatile("cli\n\thlt"); }
+    }
+
+    /* Same VMCS layout as BSP, built against the shared EPT. setupTss()
+     * is deliberately BSP-only (it writes the GDT's TSS slot and runs
+     * LTR, which #GPs on a busy TSS); see the comment on initializeVmcs
+     * for the full story. */
+    if (!initializeVmcs(eptPointer)) {
+        logError("AP: initializeVmcs failed\n");
+        for (;;) { __asm__ volatile("cli\n\thlt"); }
+    }
+
+    /* Override the guest CS/RIP: this AP's non-root execution starts in
+     * the tiny halt stub at AP_GUEST_STUB_ADDR (installed by BSP before
+     * the release), not the BSP test guest's entry at CS:0700 / IP:0.
+     *
+     * TODO (phase C): the SDM wants an AP that hasn't received SIPI to
+     * boot with GUEST_ACTIVITY_STATE = WAIT_FOR_SIPI so the guest OS
+     * sees it exactly as hardware would. Leaving it ACTIVE for now
+     * means the stub just runs its halt until the OS issues INIT -
+     * which still exits to us and lets the INIT/SIPI handlers do the
+     * right thing from there. */
+    writeRealModeSegment(GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR_BYTES,
+                         AP_GUEST_STUB_SEGMENT, REAL_MODE_CODE_AR);
+    vmwrite(GUEST_RIP, 0);
+
+    /* VMLAUNCH: never returns on success. bootDrive doesn't matter for
+     * an AP guest - DL isn't an MBR entry on this path. */
+    vmlaunch(0);
+    logError("AP: vmlaunch returned - halting\n");
+    for (;;) { __asm__ volatile("cli\n\thlt"); }
 }
 
 void InitializeVmm(void) {
@@ -682,6 +786,10 @@ void InitializeVmm(void) {
      * changed after launch (e.g. to protect host memory), each change
      * needs an INVEPT. */
     logSection("VMCS");
+    /* BSP-only: writes the GDT's TSS descriptor and executes LTR. APs
+     * reuse the slot and must skip this - see the comment on
+     * initializeVmcs for why. */
+    setupTss();
     if (!initializeVmcs(eptPointer)) {
         return;
     }
@@ -723,6 +831,17 @@ void InitializeVmm(void) {
     for (int i = 0; i < protectCount; i++) {
         hideEptRange(eptPml4, protect[i].base, protect[i].end);
     }
+
+    /* Install the AP guest stub and publish the shared EPTP. APs have
+     * been waiting in apBringUp()'s spin on apSharedReady - they now
+     * walk through the same VMX bring-up the BSP just did, land on
+     * their own VMCS pointing at this EPT, and VMLAUNCH into the halt
+     * stub above. Order matters: stub + hooks + EPT hiding must all be
+     * in place before APs can launch, or their guests would see a VMM
+     * that isn't quite finished setting itself up. */
+    installApGuestStub();
+    __atomic_store_n(&apSharedEptPointer, eptPointer, __ATOMIC_RELEASE);
+    __atomic_store_n(&apSharedReady, 1u, __ATOMIC_RELEASE);
 
     logInfo("Guest is launching...\n");
     vmlaunch(bootDrive);

@@ -654,6 +654,28 @@ void handleVmExit(GuestRegisters *regs) {
         advanceGuestRip(ctx);
         return;
 
+    case EXIT_REASON_INIT_SIGNAL:
+    case EXIT_REASON_SIPI:
+        /* Windows's BSP guest issues INIT/SIPI to the AP guests to wake
+         * them up for SMP. Each one exits here because the AP is in VMX
+         * non-root (the whole point of Phase B). The proper handler -
+         * transition the AP's guest activity state to WAIT_FOR_SIPI on
+         * INIT, then on SIPI rewrite the AP's VMCS so its guest resumes
+         * at the SIPI vector in real mode - is Phase C. For now, resume
+         * the AP's guest as-is: it stays in its halt stub, Windows times
+         * out waiting for the AP and either boots BSP-only or BSODs with
+         * a MULTIPROCESSOR_* code, but the host VMM stays intact and
+         * Windows's BSP keeps running on this CPU's own guest. One log
+         * line per exit so we can see the handshake attempts without the
+         * fatal-dump spam the default case produces. */
+        if (ctx->exitReason == EXIT_REASON_INIT_SIGNAL) {
+            logInfo("guest INIT received - ignored (phase C)\n");
+        } else {
+            logInfo("guest SIPI vector 0x%x - ignored (phase C)\n",
+                    (unsigned)(ctx->exitQualification & 0xFFu));
+        }
+        return;
+
     /* --- Fatal for now --- */
     case EXIT_REASON_EPT_VIOLATION:
         logError("EPT violation at guest-physical %lx (linear %lx, qualification %lx)\n",

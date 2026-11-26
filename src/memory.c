@@ -52,6 +52,22 @@
 extern uint8_t __kernel_start[];
 extern uint8_t __kernel_end[];
 
+/* Spinlock around the allocator state below. allocateMemory mutates
+ * both the E820 region's remaining length and the allocLow/allocHigh
+ * tracking; once APs start calling it concurrently with the BSP, those
+ * writes race without a lock. 0 = free, 1 = held. */
+static volatile uint32_t allocLock = 0;
+
+static void acquireAllocLock(void) {
+    while (__sync_lock_test_and_set(&allocLock, 1)) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void releaseAllocLock(void) {
+    __sync_lock_release(&allocLock);
+}
+
 /* The allocator's footprint, tracked separately from the kernel image
  * rather than merged into one span. The two sit far apart - the kernel
  * at 1MB, the allocations near the top of RAM - so a single enclosing
@@ -97,6 +113,8 @@ void *allocateMemory(uint64_t length) {
     MemoryMapTable *table = (MemoryMapTable *)MEMORY_MAP_TABLE_ADDR;
     uint64_t len = ALIGN_UP(length, PAGE_SIZE);
 
+    acquireAllocLock();
+
     /* Last usable region with enough room wins - simple, not best-fit,
      * good enough while every allocation still happens at boot time.
      * Clamped to ALLOC_LIMIT: a region's effective top is min(real top,
@@ -115,6 +133,7 @@ void *allocateMemory(uint64_t length) {
         chosenEnd = end;
     }
     if (chosen < 0) {
+        releaseAllocLock();
         return 0;
     }
 
@@ -127,8 +146,12 @@ void *allocateMemory(uint64_t length) {
      * region above the clip is unreachable anyway, so hiding it keeps
      * later calls honest about what's still available. */
     region->length -= (region->baseAddress + region->length) - (allocationEnd - len);
-    memset(allocationAddress, 0, len);
     recordAllocation((uint64_t)allocationAddress, allocationEnd);
+    releaseAllocLock();
+
+    /* memset outside the lock - it's the biggest part of the call and
+     * doesn't touch any shared state. */
+    memset(allocationAddress, 0, len);
 
 #if DEBUG_ALLOCATIONS
     logInfo("allocateMemory: %lu bytes at %p (region %d, %lu bytes left there)\n",

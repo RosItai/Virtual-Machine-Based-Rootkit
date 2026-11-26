@@ -100,9 +100,20 @@ build: build/vmbr.iso
 DISK_IMG ?= test_disk.img
 DISK_FMT ?= raw
 MEM      ?= 2G
-# SMP: still defaults to 1 until boot.asm parks APs (see the comment on
-# the debug target). Raise it to exercise ACPI MADT CPU detection.
 SMP      ?= 1
+
+# Shortcut: boot the real Windows 10 install under VMBR with SMP enabled.
+# Lives beside `run` so the full qemu command stays in one place - this
+# just forwards to `run` with the Win10 image/format/RAM baked in and SMP
+# defaulting to 4 (override on the command line if you want a different
+# count). Keeps the long `DISK_IMG=... DISK_FMT=qcow2 MEM=8G` form out of
+# day-to-day use.
+WIN10_IMG ?= $(abspath Win10/win10.qcow2)
+run-win10:
+	$(MAKE) run DISK_IMG=$(WIN10_IMG) DISK_FMT=qcow2 MEM=8G SMP=$(if $(filter-out 1,$(SMP)),$(SMP),4)
+
+run-win10-gui:
+	$(MAKE) run-gui DISK_IMG=$(WIN10_IMG) DISK_FMT=qcow2 MEM=8G SMP=$(if $(filter-out 1,$(SMP)),$(SMP),4)
 
 run: build
 	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp $(SMP) -enable-kvm -cpu host -machine smm=off -nographic -no-reboot -d cpu_reset 2>&1 | tee /tmp/vmbr_last_run.log

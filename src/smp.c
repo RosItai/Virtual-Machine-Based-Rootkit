@@ -2,11 +2,8 @@
  * SMP bring-up: copies the real-mode AP trampoline into low memory,
  * then sends the Intel SDM 10.4.4.1 "INIT, SIPI, SIPI" sequence to
  * every AP the firmware reports. Each AP wakes up at the SIPI vector
- * (page number) * 0x1000, runs the trampoline, and reports back by
- * bumping the shared arrival counter.
- *
- * Phase-A scope: just prove we can wake every AP. Later phases turn the
- * trampoline into a full real-protected-long transition into ap_main.
+ * (page number) * 0x1000, runs the trampoline through real -> 32-bit
+ * -> long mode, and ends up in ap_main().
  */
 #include <stdint.h>
 #include "smp.h"
@@ -16,17 +13,15 @@
 #include "string.h"
 
 /* Symbols from ap_trampoline.asm: the blob's start/end labels (to
- * compute its byte length) and the fixed low-memory addresses the
- * trampoline writes to. */
+ * compute its byte length) and the fixed low-memory slot it lives in
+ * once copied. */
 extern uint8_t ap_trampoline_start[];
 extern uint8_t ap_trampoline_end[];
 extern uint32_t ap_trampoline_addr_val;    /* where the blob gets copied */
-extern uint32_t ap_arrival_counter_val;    /* what APs lock-inc on arrival */
 
-/* Local APIC - MMIO mode (xAPIC). Enough for wake-up IPIs; x2APIC would
- * use MSR 0x830 instead, but xAPIC is universal. The ICR is split in
- * two 32-bit registers 16 bytes apart: write high (destination) first,
- * then low (vector + delivery mode) which also *sends* the IPI. */
+/* Local APIC - MMIO mode (xAPIC). The ICR is split in two 32-bit
+ * registers 16 bytes apart: write high (destination) first, then low
+ * (vector + delivery mode) which also *sends* the IPI. */
 #define LAPIC_BASE          0xFEE00000ull
 #define LAPIC_ICR_LOW       0x300u
 #define LAPIC_ICR_HIGH      0x310u
@@ -51,10 +46,10 @@ static void waitForIpiIdle(void) {
     }
 }
 
-/* Spin a known-wide-margin busy loop. The SDM wants 10ms between INIT
- * and SIPI and 200us between SIPIs, but we don't have calibrated
- * timers yet - a large plain loop is well over the 200us floor at
- * KVM speeds and safe under 10ms either way. */
+/* Spin a known-wide-margin busy loop. The SDM wants 10 ms between INIT
+ * and SIPI and 200 us between SIPIs, but we don't have calibrated
+ * timers yet - a large plain loop is well over the 200 us floor at
+ * KVM speeds and safe under 10 ms either way. */
 static void spinDelay(uint64_t iterations) {
     for (volatile uint64_t i = 0; i < iterations; i++) {
         __asm__ volatile("pause");
@@ -68,13 +63,8 @@ static void sendIpi(uint32_t apicId, uint32_t icrLowFlags) {
 }
 
 static void sendInitSipiSipi(uint32_t apicId, uint8_t sipiVector) {
-    /* Step 1: INIT. Vector is ignored for INIT delivery mode. */
     sendIpi(apicId, ICR_DELIVERY_INIT | ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE);
     spinDelay(1000000);
-
-    /* Steps 2+3: two SIPIs, same vector. The SDM recommends sending
-     * SIPI twice because the first may be lost if the AP hasn't quite
-     * finished the INIT transition when it arrives. */
     sendIpi(apicId, ICR_DELIVERY_SIPI | ICR_LEVEL_ASSERT | sipiVector);
     spinDelay(100000);
     sendIpi(apicId, ICR_DELIVERY_SIPI | ICR_LEVEL_ASSERT | sipiVector);
@@ -89,19 +79,15 @@ int wakeAps(int totalCpuCount) {
     void *trampolineSlot = (void *)(uint64_t)ap_trampoline_addr_val;
     memcpy(trampolineSlot, ap_trampoline_start, blobSize);
 
-    /* 2. Zero the arrival counter so we're measuring THIS boot's APs. */
-    volatile uint32_t *counter = (volatile uint32_t *)(uint64_t)ap_arrival_counter_val;
-    *counter = 0;
-
-    /* 3. Figure out our own APIC ID (CPUID.1:EBX[31:24]) so we don't
-     *    try to INIT ourselves - sending INIT to the BSP would reset us. */
+    /* 2. Our own APIC ID (CPUID.1:EBX[31:24]) so we don't try to INIT
+     *    ourselves - sending INIT to the BSP would reset us. */
     uint32_t eax, ebx, ecx, edx;
     cpuid(1, &eax, &ebx, &ecx, &edx);
     uint32_t bspApicId = ebx >> 24;
 
-    /* 4. Walk APIC IDs 0..totalCpuCount-1 and INIT-SIPI each AP.
-     *    QEMU assigns APIC IDs contiguously starting at 0, so this is
-     *    a safe shortcut here; a real MADT walk would be more portable. */
+    /* 3. INIT-SIPI each AP. QEMU assigns APIC IDs contiguously from 0,
+     *    so a simple range walk is enough here; a real MADT walk
+     *    would be more portable. */
     uint8_t sipiVector = (uint8_t)(ap_trampoline_addr_val >> 12);
     int apsTargeted = 0;
     for (uint32_t id = 0; id < (uint32_t)totalCpuCount; id++) {
@@ -110,12 +96,12 @@ int wakeAps(int totalCpuCount) {
         apsTargeted++;
     }
 
-    /* 5. Give the APs time to reach the trampoline and bump the
-     *    counter, then read it back. */
+    /* 4. Give the APs a moment to climb through the trampoline into
+     *    long mode before their ap_main() logs start interleaving
+     *    with whatever the BSP prints next. */
     spinDelay(5000000);
-    int arrived = (int)*counter;
 
-    logInfo("SMP: BSP APIC ID %u, sent INIT-SIPI (vector=0x%x) to %d AP(s), %d arrived\n",
-            bspApicId, sipiVector, apsTargeted, arrived);
-    return arrived;
+    logInfo("SMP: woke %d AP(s) via SIPI vector 0x%x -> %p\n",
+            apsTargeted, sipiVector, trampolineSlot);
+    return apsTargeted;
 }

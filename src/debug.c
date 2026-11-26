@@ -22,6 +22,23 @@
 #include "debug.h"
 #include "colors.h"
 
+/* Serial port is one global device, and once APs started calling logInfo
+ * concurrently with the BSP (SMP bring-up in apBringUp) their messages
+ * interleaved mid-line into garbage. One spinlock around each public
+ * entry point keeps every emitted message atomic; the printing itself
+ * never blocks so the critical section stays short. 0 = free, 1 = held. */
+static volatile uint32_t logLock = 0;
+
+static void acquireLog(void) {
+    while (__sync_lock_test_and_set(&logLock, 1)) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void releaseLog(void) {
+    __sync_lock_release(&logLock);
+}
+
 static void print_unsigned(unsigned long value, unsigned base) {
     char digits[32];            /* enough for a 64-bit value in base 2 */
     int len = 0;
@@ -121,31 +138,39 @@ static void vprintf_impl(const char *fmt, va_list args) {
 void printf(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
+    acquireLog();
     vprintf_impl(fmt, args);
+    releaseLog();
     va_end(args);
 }
 
 void logInfo(const char *fmt, ...) {
-    serial_print(COLOR_GREEN "[INFO] " COLOR_RESET);
     va_list args;
     va_start(args, fmt);
+    acquireLog();
+    serial_print(COLOR_GREEN "[INFO] " COLOR_RESET);
     vprintf_impl(fmt, args);
+    releaseLog();
     va_end(args);
 }
 
 void logSection(const char *fmt, ...) {
-    serial_print("\n" COLOR_CYAN COLOR_BOLD "== ");
     va_list args;
     va_start(args, fmt);
+    acquireLog();
+    serial_print("\n" COLOR_CYAN COLOR_BOLD "== ");
     vprintf_impl(fmt, args);
-    va_end(args);
     serial_print(" ==" COLOR_RESET "\n");
+    releaseLog();
+    va_end(args);
 }
 
 void logError(const char *fmt, ...) {
-    serial_print(COLOR_RED "[ERROR] " COLOR_RESET);
     va_list args;
     va_start(args, fmt);
+    acquireLog();
+    serial_print(COLOR_RED "[ERROR] " COLOR_RESET);
     vprintf_impl(fmt, args);
+    releaseLog();
     va_end(args);
 }

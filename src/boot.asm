@@ -49,6 +49,7 @@ global _start
 extern setup_paging
 extern load_gdt
 extern enter_long_mode
+extern GDT_DATA32_SEL
 
 _start:
     ; ---- BSP vs AP split ----
@@ -83,22 +84,45 @@ _start:
     hlt
     jmp .hang
 
-    ; ---- AP path ----
-    ; APs cannot touch any shared boot state until the BSP's GDT and
-    ; paging are in place. Spin on bsp_ready with `pause` to be gentle
-    ; on the fetch unit (hyperthread hint that we're in a busy wait).
+    ; ---- AP path from _start ----
+    ; This path only fires if firmware ever lets APs run from the reset
+    ; vector straight into our _start. SeaBIOS doesn't (it parks APs
+    ; in wait-for-SIPI), but keep the check defensive: if an AP does
+    ; land here, park it rather than letting it race the BSP. Phase A
+    ; of iteration 8 wakes APs through src/ap_trampoline.asm instead,
+    ; which comes in at ap_pm_entry below.
 .ap_entry:
-.ap_wait:
-    pause
-    cmp dword [bsp_ready], 0
-    je .ap_wait
+    cli
+    hlt
+    jmp .ap_entry
 
-    ; Claim a per-AP stack slot. `lock xadd` is the architectural way
-    ; to read-modify-write a shared counter atomically across cores:
-    ; eax ends up with the pre-increment value (0, 1, 2, ...), which
-    ; is our AP index. Each AP's stack is AP_STACK_SIZE bytes wide,
-    ; laid out back to back in ap_stacks; the stack grows down from
-    ; the TOP of our slot, i.e. (index + 1) * AP_STACK_SIZE bytes in.
+; -------------------------------------------------------------------
+; ap_pm_entry: the 32-bit landing pad ap_trampoline.asm far-jumps to
+; after it has flipped CR0.PE and left real mode. By the time we get
+; here the BSP has already finished its own boot setup (SMP wake-up
+; runs out of kernel_main), so there's no bsp_ready wait - we go
+; straight to picking a per-AP stack and entering long mode.
+; -------------------------------------------------------------------
+global ap_pm_entry
+ap_pm_entry:
+    ; We arrived via `jmp far` with CS=GDT_CODE32_SEL after the
+    ; trampoline switched from real to 32-bit and reloaded the kernel's
+    ; full GDT. The data segments still carry the AP's blob-local
+    ; selectors; load the matching flat 32-bit data selector so [mem]
+    ; accesses through them work.
+    mov eax, GDT_DATA32_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; Claim a per-AP stack slot. `lock xadd` reads-modifies-writes a
+    ; shared counter atomically across cores: eax ends up with the
+    ; pre-increment value (0, 1, 2, ...), our AP index. Each AP's
+    ; stack is AP_STACK_SIZE bytes, stacks are back-to-back in
+    ; ap_stacks, and the stack grows down from the TOP of the slot:
+    ; (index + 1) * AP_STACK_SIZE bytes into the array.
     mov eax, 1
     lock xadd [ap_counter], eax
     inc eax
@@ -106,7 +130,6 @@ _start:
     mov esp, ap_stacks
     add esp, eax
 
-    call load_gdt               ; load the shared GDT pointer - idempotent
     call enter_long_mode        ; same transition as BSP; long_mode_entry
                                 ; re-checks the BSP bit to split paths
                                 ; back apart once 64-bit code starts.
