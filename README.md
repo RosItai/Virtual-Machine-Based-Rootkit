@@ -25,9 +25,12 @@ a guest that it fully controls through VM exits.
 No libc, no RTOS, no framework. Just C and x86 assembly talking to the hardware
 directly, built one iteration at a time against the Intel SDM.
 
-> **Current state:** boots Windows 10 all the way to the sign-in screen and desktop,
-> on a single CPU, with the hypervisor's own memory protected from the guest at the
-> EPT layer. SMP bring-up for the guest is in progress.
+> **Current state:** boots Windows 10 all the way to the sign-in screen and desktop
+> with **4-way SMP** — the hypervisor wakes every logical CPU the host reports,
+> each AP runs its own `VMXON`/`VMCS` in VMX non-root, and INIT/SIPI from the
+> Windows guest is translated into the real activity-state handshake on each
+> AP's VMCS. The hypervisor's own memory is unreadable to the guest at the EPT
+> layer.
 
 ![Windows 10 running as a VMBR guest, with the hypervisor's serial log on the left](docs/images/windows-guest.png)
 
@@ -248,9 +251,16 @@ tools/install_windows.sh
 # down from inside the VM, then close QEMU.
 
 # 2. Boot that installed disk UNDER VMBR:
-make run     DISK_IMG=Win10/win10.qcow2 DISK_FMT=qcow2 MEM=8G
-make run-gui DISK_IMG=Win10/win10.qcow2 DISK_FMT=qcow2 MEM=8G SMP=4
+make run-win10        # 4-way SMP, 8 GB, headless, serial log to stdout
+make run-win10-gui    # same + the VGA window so you can see the desktop
 ```
+
+Both default to `SMP=4` (override with e.g. `make run-win10 SMP=2`) and look
+for `Win10/win10.qcow2` next to the Makefile. If an earlier VMBR crash left
+Windows stuck in "Preparing Automatic Repair" on every subsequent boot,
+`make fix-win10-bcd` boots the Windows install ISO against your qcow2 (no
+VMBR in the loop) so you can reach WinRE's Command Prompt and clear the
+`bcdedit` recovery flags — a one-time escape hatch, not a day-to-day target.
 
 The script creates `Win10/win10.qcow2` (~40 GB sparse, grows on demand)
 and expects a Windows install ISO at `Win10/Windows.iso`. Both paths are
@@ -298,15 +308,19 @@ src/
   ept.c               identity EPT (8 GB), memory types from the MTRRs,
                       per-page R/W/X hiding of the VMM's own range
   vmexit_entry.asm    the VM-exit stub (saves guest state, resumes)
-  vmexit.c            VM-exit dispatcher + per-reason handlers
+  vmexit.c            dispatcher + per-reason handlers; includes INIT/SIPI
+                      activity-state transitions, the guest page-table
+                      walker, and the host-native REP INS/OUTS emulator
+                      that Windows's IDE path hits once SMP is up
   hooks.c             guest-facing hooks (E820 and INT 13h observers)
   int15_hook.asm      real-mode stub spliced into the guest's IVT (INT 15h)
   int13_hook.asm      observe-and-chain INT 13h hook (disk access)
   disk.c              high-level BIOS int 0x13 driver (DAP, bounce buffer)
   acpi.c              RSDP → RSDT/XSDT → MADT CPU count
   smp.c               Local APIC INIT-SIPI-SIPI to wake the APs
-  ap_trampoline.asm   the real-mode stub each AP wakes up into
-  ap.c                ap_main — per-AP long-mode entry
+  ap_trampoline.asm   per-AP real → 32-bit → long-mode stub (A20, GDT swap)
+  ap.c                ap_main → apBringUp: per-AP VMXON + VMCS + VMLAUNCH
+                      landing in GUEST_ACTIVITY_WAIT_FOR_SIPI
   guest.asm           the real-mode test guest (used when no disk is given)
 include/              the matching headers
 tools/
@@ -317,8 +331,8 @@ tools/
 
 ## Status & roadmap
 
-**Working today** — boots **Windows 10** as the guest, on a single CPU, with the
-hypervisor's own memory inaccessible to it:
+**Working today** — boots **Windows 10** as the guest with **4-way SMP**, and
+the hypervisor's own memory is inaccessible to it:
 
 - [x] Multiboot2 / GRUB / QEMU boot chain
 - [x] 8 GB-covering paging, GDT, long mode, BIOS E820, bump allocator
@@ -333,22 +347,24 @@ hypervisor's own memory inaccessible to it:
       can't just restart the machine out from under us
 - [x] VMBR's own pages hidden from the guest at the EPT layer — a Windows write to
       the kernel range exits as an EPT violation instead of silently corrupting us
-- [x] Windows 10 boots to the sign-in screen and the desktop on a single CPU
+- [x] Windows 10 boots to the sign-in screen and the desktop
 - [x] ACPI table walk (RSDP → RSDT / XSDT → MADT) — knows how many CPUs there are
 - [x] Local APIC `INIT`-`SIPI`-`SIPI` wake-up — all APs reach a shared
       low-memory trampoline (phase A of iteration 8)
+- [x] AP trampoline does the full real → 32-bit → long-mode transition into
+      `ap_main`, with A20 unmasked via port 0x92 and a two-stage GDT switch to
+      reach the kernel GDT at 256 MB (phase B.1)
+- [x] Each AP does its own `VMXON` + `VMCS` and VMLAUNCHes in
+      `GUEST_ACTIVITY_WAIT_FOR_SIPI`, sharing the BSP's EPT (phase B.2)
+- [x] `INIT`/`SIPI` VM-exit handlers transition the AP's guest activity state
+      the way real hardware does, with SIPI rewriting CS:IP to `<vector>:0000`
+      — Windows waking its own APs now works end-to-end (phase C)
+- [x] Host-native `rep ins`/`rep outs` emulator (walks the guest's long-mode
+      page tables once per 4 KB page, then uses one host REP instruction per
+      page) — keeps Windows's driver disk reads inside the kernel DPC budget
+- [x] Windows sees and uses all 4 logical CPUs the host reports
 
-**In progress — Iteration 8: SMP**
-
-- [ ] AP trampoline does the full real → protected → long-mode transition into
-      `ap_main` (phase B)
-- [ ] Each AP does its own `VMXON` + `VMCS` with the initial guest state the
-      SDM specifies for a non-BSP CPU (phase B)
-- [ ] `INIT`/`SIPI` VM-exit handlers so Windows waking its own APs is translated
-      into VMBR waking the AP's guest VMCS (phases C/D)
-- [ ] Windows seeing (and using) every logical CPU the host reports
-
-**Beyond iteration 8**
+**Next**
 
 - [ ] Re-inject an event interrupted mid-delivery (`IDT_VECTORING_INFO`)
 - [ ] x2APIC virtualization (MSR-based APIC) for the guest
@@ -403,6 +419,52 @@ cost hours and none showed up where you'd look:
   reach it, but SeaBIOS never lets them get there. Phase A of iteration 8 copies
   a real-mode stub to 0x8000 and uses the Local APIC's ICR to deliver
   `INIT`-`SIPI`-`SIPI` to each AP the ACPI MADT reports.
+- **`push CS; push IP; retfd` from real mode rebooting the whole VM instantly** —
+  the AP's SS is still real-mode-cached (base 0, 16-bit) when the trampoline
+  runs, and the stack-side plumbing the CPU does mid-`retfd` triple-faulted
+  before any code could print. Replaced with a hand-assembled `o32 jmp far
+  [cs:FLAT(far_ptr)]` (`db 0x66, 0xFF, 0x2E; dw FLAT(far_ptr)`) so the mode
+  switch touches no stack at all.
+- **AP's `LGDT` on the kernel GDT at 256 MB loading garbage** — KVM leaves the
+  A20 line *masked* on APs after SIPI, so any access to 0x10xxxxxx wrapped bit
+  20 into the first megabyte. The real GDT at 0x10000000-ish wasn't actually
+  readable until A20 was on. Fix: two-stage GDT switch. A local 3-entry GDT
+  inside the trampoline blob gets us to 32-bit protected mode, then we unmask
+  A20 with `in/or 0x02/out al, 0x92`, *then* we `LGDT` the kernel's real GDT.
+- **BSP's serial output dying mid-sentence right after it published the handoff
+  flag to the APs** — `initializeVmcs` ran `setupTss()` which executed `LTR
+  GDT_TSS_SEL` on the one shared GDT. The BSP's `LTR` set the TSS descriptor's
+  *busy* bit; the three APs then each ran the same `LTR` on an already-busy
+  descriptor, which per SDM is `#GP(0)`. With no IDT installed the first `#GP`
+  is a triple fault, and three of them within microseconds reset the whole VM
+  before BSP's next `logInfo` could flush. Fix: `setupTss()` is BSP-only now
+  — `initializeVmcs` writes per-CPU VMCS `HOST_TR_*` fields but doesn't
+  re-execute `LTR`, because VM-exit TR reload doesn't check the busy bit.
+- **BSP + 3 APs racing on `allocateMemory` returned the same page to two
+  callers** — the bump allocator mutated `allocLow`/`allocHigh` and the chosen
+  E820 region's remaining length with no lock, so two APs picked the same
+  "top of region" for their VMXON pages. One spinlock around the region
+  pick and the length bump (letting the big `memset` run outside the lock)
+  made it SMP-safe.
+- **Serial log turning into interleaved garbage like `[I32m[NN[INFFOO]F]`** —
+  one serial device, four CPUs hitting `logInfo` concurrently, no lock. Each
+  log function now acquires a single `logLock` spinlock in `debug.c` for the
+  duration of its formatted write, so each line is atomic.
+- **Windows `CRITICAL_PROCESS_DIED` in userspace long after a clean boot** —
+  the first string-I/O emulator used `regs->rcx` as the transfer count
+  unconditionally. For a REP-prefixed `rep insw` that's correct; for a bare
+  `insb` without REP, the count is supposed to be 1 and RCX can be *anything*.
+  A single non-REP `insb` happened to have RCX in the tens of thousands, so
+  we read that many bytes from the port and sprayed them into whatever kernel
+  memory sat after RDI. Windows ran fine until a critical process dereferenced
+  the clobbered bytes. Fix: `count = hasRep ? regs->rcx : 1`.
+- **`DPC_WATCHDOG_VIOLATION` after sign-in on an otherwise working SMP boot** —
+  Windows's kernel budgets 100 ms per DPC. The naive string-I/O emulator walked
+  the guest's 4-level page table and did a single `IN`/`OUT` for *every byte*,
+  which ate through the budget on any multi-MB driver load. Fix: walk the page
+  table **once per 4 KB guest page**, then let the host CPU drive the whole
+  page with one `rep insw`/`rep outsw` instruction — two to three orders of
+  magnitude faster, and Windows reaches the desktop.
 
 ---
 
