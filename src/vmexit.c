@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include "vmexit.h"
 #include "vmcs.h"
+#include "vmcs_fields.h"
+#include "vmx.h"
 #include "cpu.h"
 #include "debug.h"
 #include "hooks.h"
@@ -214,6 +216,156 @@ static uint64_t crOperandValue(uint64_t value) {
  * Port I/O - only the three reset-capable ports reach here (bitmap)
  * =================================================================== */
 
+/* Walk the guest's long-mode page tables to turn a guest-linear address
+ * into a guest-physical one. Returns 0 on any not-present entry - callers
+ * treat 0 as "give up, don't fault into the guest" since string I/O
+ * emulation isn't supposed to synthesize page faults the guest hadn't
+ * already caused. Reads tables directly through our identity-mapped host
+ * page tables (0-8GB), which matches the EPT identity map, so a guest
+ * physical returned here is equal to the host-virtual address we can
+ * dereference. */
+static uint64_t guestLinearToPhysical(uint64_t linear) {
+    uint64_t cr3 = vmread(GUEST_CR3);
+    uint64_t *table;
+    uint64_t entry;
+
+    table = (uint64_t *)(cr3 & 0x000FFFFFFFFFF000ULL);
+    entry = table[(linear >> 39) & 0x1FFULL];
+    if (!(entry & 1)) return 0;
+
+    table = (uint64_t *)(entry & 0x000FFFFFFFFFF000ULL);
+    entry = table[(linear >> 30) & 0x1FFULL];
+    if (!(entry & 1)) return 0;
+    if (entry & (1ULL << 7)) {    /* 1GB page */
+        return (entry & 0x000FFFFFC0000000ULL) | (linear & 0x3FFFFFFFULL);
+    }
+
+    table = (uint64_t *)(entry & 0x000FFFFFFFFFF000ULL);
+    entry = table[(linear >> 21) & 0x1FFULL];
+    if (!(entry & 1)) return 0;
+    if (entry & (1ULL << 7)) {    /* 2MB page */
+        return (entry & 0x000FFFFFFFE00000ULL) | (linear & 0x1FFFFFULL);
+    }
+
+    table = (uint64_t *)(entry & 0x000FFFFFFFFFF000ULL);
+    entry = table[(linear >> 12) & 0x1FFULL];
+    if (!(entry & 1)) return 0;
+    return (entry & 0x000FFFFFFFFFF000ULL) | (linear & 0xFFFULL);
+}
+
+/* REP INS / REP OUTS emulation. The exit qualification gives us port,
+ * direction, and operand size; the rest (count, address, direction flag,
+ * ES base) comes from the guest's register and VMCS state.
+ *
+ * The buffer lives at ES:RDI (INS) or DS:RSI (OUTS). In long mode the
+ * segment base is 0 and RDI/RSI is the full linear address; in real or
+ * protected mode the base is nonzero and the effective offset width
+ * depends on the address-size prefix. The Windows cases we've seen so
+ * far (IDE/ATAPI driver) are long-mode kernel code, so this handles the
+ * long-mode path and bails cleanly on anything exotic - CPU-mode-aware
+ * emulation can land when a non-long-mode guest actually needs it. */
+/* Native REP INS/OUTS wrappers. These run ONE instruction - "rep insw"
+ * (etc.) - against a chunk of memory in our address space (which, thanks
+ * to the host identity map of 0-8GB, is the same bytes the guest sees
+ * through its EPT). One VM-exit-to-userspace for a 4KB page beats one
+ * per word, which is what the earlier byte-at-a-time emulator effectively
+ * cost and what triggered DPC_WATCHDOG_VIOLATION.
+ *
+ * The constraints:
+ *   - "+D"(ptr)   : RDI is read as the base host-virtual address AND
+ *                   updated by the CPU as REP advances it; we don't use
+ *                   the updated value (we recompute per page anyway).
+ *   - "+c"(count) : RCX is read as the iteration count AND decremented
+ *                   to zero by REP on success - also discarded.
+ *   - "d"(port)   : DX holds the port; REP INS/OUTS use DX implicitly.
+ *   - clobber "memory" so the compiler doesn't reorder nearby loads/stores.
+ * Interrupts are off throughout VM-exit handling (vmexit_entry.asm keeps
+ * IF clear), so these REP sequences can't be interrupted. */
+static inline void hostRepIn(uint16_t port, void *dst, uint64_t count, uint32_t bytes) {
+    switch (bytes) {
+    case 1: __asm__ volatile("cld; rep insb" : "+D"(dst), "+c"(count) : "d"(port) : "memory"); break;
+    case 2: __asm__ volatile("cld; rep insw" : "+D"(dst), "+c"(count) : "d"(port) : "memory"); break;
+    case 4: __asm__ volatile("cld; rep insl" : "+D"(dst), "+c"(count) : "d"(port) : "memory"); break;
+    }
+}
+
+static inline void hostRepOut(uint16_t port, const void *src, uint64_t count, uint32_t bytes) {
+    switch (bytes) {
+    case 1: __asm__ volatile("cld; rep outsb" : "+S"(src), "+c"(count) : "d"(port) : "memory"); break;
+    case 2: __asm__ volatile("cld; rep outsw" : "+S"(src), "+c"(count) : "d"(port) : "memory"); break;
+    case 4: __asm__ volatile("cld; rep outsl" : "+S"(src), "+c"(count) : "d"(port) : "memory"); break;
+    }
+}
+
+/* If the guest set DF (direction = decrement), fall back to a slower
+ * byte-at-a-time path that steps backwards. Windows's IDE driver only
+ * ever uses DF=0, so this is a correctness fallback, not a hot path. */
+static void emulateStringIoDecrementing(uint16_t port, int isIn, uint64_t *addrPtr,
+                                        uint64_t segBase, uint64_t count, uint32_t bytes) {
+    int64_t step = -(int64_t)bytes;
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t phys = guestLinearToPhysical(segBase + *addrPtr);
+        if (!phys) {
+            logError("string I/O (DF=1) on port 0x%x: unmapped guest linear %lx - halting\n",
+                     port, segBase + *addrPtr);
+            haltForever();
+        }
+        if (isIn) hostRepIn(port, (void *)phys, 1, bytes);
+        else      hostRepOut(port, (const void *)phys, 1, bytes);
+        *addrPtr = (uint64_t)((int64_t)*addrPtr + step);
+    }
+}
+
+static void emulateStringIo(VmExitContext *ctx, uint16_t port, int isIn, uint32_t bytes,
+                            int hasRep) {
+    GuestRegisters *regs = ctx->registers;
+    uint64_t rflags = vmread(GUEST_RFLAGS);
+    uint64_t segBase = isIn ? vmread(GUEST_ES_BASE) : vmread(GUEST_DS_BASE);
+    uint64_t *addrPtr = isIn ? &regs->rdi : &regs->rsi;
+    /* Only REP-prefixed string ops use (R/E)CX as a count; a bare INS/OUTS
+     * transfers exactly one element. Using RCX unconditionally caused us
+     * to walk off into arbitrary guest memory whenever Windows issued a
+     * non-REP string I/O, producing the kind of "random bytes somewhere
+     * in kernel data" corruption that surfaces minutes later as a BSOD. */
+    uint64_t count = hasRep ? regs->rcx : 1;
+
+    if (rflags & (1ULL << 10)) {
+        emulateStringIoDecrementing(port, isIn, addrPtr, segBase, count, bytes);
+    } else {
+        /* Fast path: forward REP, one page at a time. Walk the guest's
+         * page tables once per 4KB page, then let the host CPU drive the
+         * whole page's worth of I/O with a single REP instruction. This
+         * is what keeps Windows's multi-MB driver reads inside the DPC
+         * watchdog's 100ms budget. */
+        while (count > 0) {
+            uint64_t linear = segBase + *addrPtr;
+            uint64_t phys = guestLinearToPhysical(linear);
+            if (!phys) {
+                logError("string I/O on port 0x%x: unmapped guest linear %lx - halting\n",
+                         port, linear);
+                dumpVmcsState();
+                haltForever();
+                return;
+            }
+            uint64_t bytesLeftInPage = 0x1000ull - (linear & 0xFFFull);
+            uint64_t runCount = bytesLeftInPage / bytes;
+            if (runCount == 0) runCount = 1;   /* an op straddling the page edge */
+            if (runCount > count) runCount = count;
+
+            if (isIn) hostRepIn(port, (void *)phys, runCount, bytes);
+            else      hostRepOut(port, (const void *)phys, runCount, bytes);
+
+            uint64_t advanced = runCount * bytes;
+            *addrPtr += advanced;
+            count    -= runCount;
+        }
+    }
+    if (hasRep) {
+        regs->rcx = 0;
+    }
+    advanceGuestRip(ctx);
+}
+
 static void handleIoInstruction(VmExitContext *ctx) {
     uint64_t qual    = ctx->exitQualification;
     uint16_t port    = IO_ACCESS_PORT(qual);
@@ -221,11 +373,14 @@ static void handleIoInstruction(VmExitContext *ctx) {
     uint32_t szCode  = IO_ACCESS_SIZE(qual);  /* 0=byte, 1=word, 3=dword */
     uint32_t bytes   = (szCode == 3) ? 4u : (1u << szCode);
 
-    /* String I/O (INS/OUTS) or REP on these ports is bizarre - halt. */
+    /* String I/O (INS/OUTS) or REP: Windows's IDE/ATAPI driver issues
+     * `rep ins` on the data port to drain a sector into memory - Phase C
+     * hit this on port 0x170 (secondary IDE, the CD drive QEMU attaches
+     * for VMBR's own boot ISO). Emulate by looping word/byte-at-a-time
+     * through the port and writing to guest memory (or vice versa for
+     * REP OUTS); emulateStringIo walks the guest's page tables itself. */
     if (IO_ACCESS_IS_STRING(qual) || IO_ACCESS_HAS_REP(qual)) {
-        logError("string/REP I/O on port 0x%x - not emulated, halting\n", port);
-        dumpVmcsState();
-        haltForever();
+        emulateStringIo(ctx, port, isIn, bytes, IO_ACCESS_HAS_REP(qual));
         return;
     }
 
@@ -655,26 +810,39 @@ void handleVmExit(GuestRegisters *regs) {
         return;
 
     case EXIT_REASON_INIT_SIGNAL:
-    case EXIT_REASON_SIPI:
-        /* Windows's BSP guest issues INIT/SIPI to the AP guests to wake
-         * them up for SMP. Each one exits here because the AP is in VMX
-         * non-root (the whole point of Phase B). The proper handler -
-         * transition the AP's guest activity state to WAIT_FOR_SIPI on
-         * INIT, then on SIPI rewrite the AP's VMCS so its guest resumes
-         * at the SIPI vector in real mode - is Phase C. For now, resume
-         * the AP's guest as-is: it stays in its halt stub, Windows times
-         * out waiting for the AP and either boots BSP-only or BSODs with
-         * a MULTIPROCESSOR_* code, but the host VMM stays intact and
-         * Windows's BSP keeps running on this CPU's own guest. One log
-         * line per exit so we can see the handshake attempts without the
-         * fatal-dump spam the default case produces. */
-        if (ctx->exitReason == EXIT_REASON_INIT_SIGNAL) {
-            logInfo("guest INIT received - ignored (phase C)\n");
-        } else {
-            logInfo("guest SIPI vector 0x%x - ignored (phase C)\n",
-                    (unsigned)(ctx->exitQualification & 0xFFu));
-        }
+        /* Windows's BSP guest sent INIT to this AP's guest to begin its
+         * SMP bring-up. Per SDM Vol. 3C 10.4.2, INIT puts the target
+         * logical processor into the WAIT_FOR_SIPI state - we have to
+         * mirror that on the AP's VMCS so the next SIPI is handled
+         * correctly. VMX already saved the pre-INIT guest state, and
+         * most of the architectural reset INIT does on real hardware is
+         * irrelevant to a guest that was already in our halt stub with
+         * CR0.PE=0; the parts that do matter are the activity state and
+         * clearing any pending STI/MOV-SS blocking so a SIPI entry isn't
+         * refused on an interruptibility edge. */
+        vmwrite(GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_WAIT_FOR_SIPI);
+        vmwrite(GUEST_INTERRUPTIBILITY_INFO,
+                vmread(GUEST_INTERRUPTIBILITY_INFO) & ~INTERRUPTIBILITY_BLOCKING_MASK);
+        logInfo("guest INIT - AP guest now WAIT_FOR_SIPI\n");
         return;
+
+    case EXIT_REASON_SIPI: {
+        /* A SIPI only takes effect on a logical processor currently in
+         * WAIT_FOR_SIPI (SDM Vol. 3C 10.4.2); the hardware filters stray
+         * SIPIs itself. VMX hands us the vector in the low 8 bits of the
+         * exit qualification. Rewrite the guest CS to <vector>:0000 (so
+         * execution starts at physical 0x000VV000) and flip the activity
+         * state back to ACTIVE so the AP actually runs this time. The
+         * SDM also wants an INIT-SIPI-SIPI sequence: the hardware drops
+         * the second SIPI if the AP is already active, but if we get it
+         * as an exit we'll just rewrite CS/IP again - harmless. */
+        uint8_t sipiVector = (uint8_t)(ctx->exitQualification & 0xFFu);
+        setGuestSipiStartPoint(sipiVector);
+        vmwrite(GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_ACTIVE);
+        logInfo("guest SIPI vector 0x%x - AP guest resumes at %x:0000\n",
+                (unsigned)sipiVector, (unsigned)sipiVector << 8);
+        return;
+    }
 
     /* --- Fatal for now --- */
     case EXIT_REASON_EPT_VIOLATION:

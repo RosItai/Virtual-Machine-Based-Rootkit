@@ -127,7 +127,7 @@ static const char *art[] = {
     0
 };
 
-static const char *author = "by: Itai Rosenperl";
+static const char *name = "by: Itai Rosenperl";
 
 static int leading_spaces(const char *s) {
     int n = 0;
@@ -160,7 +160,7 @@ static void print_art_and_author(int term_width) {
     /* Author line goes on the row right after the art - no gap - at
      * the leftmost ink column, not the raw string's start column. */
     cursor_goto(TOP_ROW + num_lines, ink_col);
-    serial_print(author);
+    serial_print(name);
     serial_print(COLOR_RESET);
 }
 

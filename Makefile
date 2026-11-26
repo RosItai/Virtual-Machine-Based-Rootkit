@@ -115,6 +115,19 @@ run-win10:
 run-win10-gui:
 	$(MAKE) run-gui DISK_IMG=$(WIN10_IMG) DISK_FMT=qcow2 MEM=8G SMP=$(if $(filter-out 1,$(SMP)),$(SMP),4)
 
+# Boot the Windows installer ISO against the installed Windows qcow2, NO
+# VMBR in the loop. Lets you reach WinRE "Repair your computer" ->
+# Troubleshoot -> Advanced -> Command Prompt to clear the "boot keeps
+# failing, force Automatic Repair" marker that our earlier BSOD/triple-
+# fault runs left in the BCD:
+#   bcdedit /set {default} recoveryenabled No
+#   bcdedit /set {default} bootstatuspolicy IgnoreAllFailures
+# Then close the window, and plain `make run-win10` will boot straight
+# into Windows again instead of looping on Automatic Repair.
+WIN10_INSTALL_ISO ?= $(abspath Win10/Windows.iso)
+fix-win10-bcd:
+	qemu-system-x86_64 -cdrom $(WIN10_INSTALL_ISO) -drive file=$(WIN10_IMG),format=qcow2,index=0,media=disk -boot d -m 4G -smp 2 -enable-kvm -cpu host -machine smm=off -usb -device usb-tablet -device usb-kbd -display gtk
+
 run: build
 	qemu-system-x86_64 -cdrom build/vmbr.iso -drive file=$(DISK_IMG),format=$(DISK_FMT),index=0,media=disk -boot d -m $(MEM) -smp $(SMP) -enable-kvm -cpu host -machine smm=off -nographic -no-reboot -d cpu_reset 2>&1 | tee /tmp/vmbr_last_run.log
 

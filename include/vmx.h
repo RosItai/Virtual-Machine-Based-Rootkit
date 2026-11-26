@@ -30,4 +30,15 @@ void InitializeVmm(void);
  */
 void apBringUp(void);
 
+/* SIPI handler support (vmexit.c calls this). Rewrites the CURRENT
+ * VMCS's guest CS selector/base/limit/AR so the guest resumes in real
+ * mode at CS:IP = (vector:0000), i.e. physical (vector << 12). The SDM
+ * says a SIPI with vector VV starts the AP at linear 0x000VV000H -
+ * exactly what writeRealModeSegment produces when its selector input
+ * is (vector << 8). Also resets GUEST_RIP to 0 and clears any STI/MOV-
+ * SS interruptibility blocking. Does NOT change activity state - the
+ * caller sets it to ACTIVE after this returns, so a bad VMCS edit
+ * stays detectable before the guest resumes. */
+void setGuestSipiStartPoint(uint8_t vector);
+
 #endif

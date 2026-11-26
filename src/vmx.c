@@ -240,6 +240,22 @@ static void writeRealModeSegment(uint64_t selectorField, uint64_t baseField, uin
     vmwrite(accessRightsField, accessRights);
 }
 
+/* Phase C: point the CURRENT VMCS's guest at the SIPI start point.
+ * A SIPI with vector VV tells an AP to start executing at physical
+ * address 0x000VV000. In real mode that's CS = VV << 8, IP = 0, base
+ * = VV << 12 - exactly what writeRealModeSegment emits when its
+ * selector input is (vector << 8). The vmexit dispatcher calls this
+ * on an EXIT_REASON_SIPI exit before moving the guest's activity
+ * state back to ACTIVE. */
+void setGuestSipiStartPoint(uint8_t vector) {
+    uint16_t sipiSegment = (uint16_t)vector << 8;
+    writeRealModeSegment(GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR_BYTES,
+                         sipiSegment, REAL_MODE_CODE_AR);
+    vmwrite(GUEST_RIP, 0);
+    vmwrite(GUEST_INTERRUPTIBILITY_INFO,
+            vmread(GUEST_INTERRUPTIBILITY_INFO) & ~INTERRUPTIBILITY_BLOCKING_MASK);
+}
+
 static void initializeGuestState(void) {
     /* Ask for nothing at all in CR0/CR4 and let writeGuestCr0/Cr4 add
      * back whatever VMX insists on: PE=0 and PG=0 (real mode, which
@@ -709,19 +725,25 @@ void apBringUp(void) {
         for (;;) { __asm__ volatile("cli\n\thlt"); }
     }
 
-    /* Override the guest CS/RIP: this AP's non-root execution starts in
-     * the tiny halt stub at AP_GUEST_STUB_ADDR (installed by BSP before
-     * the release), not the BSP test guest's entry at CS:0700 / IP:0.
-     *
-     * TODO (phase C): the SDM wants an AP that hasn't received SIPI to
-     * boot with GUEST_ACTIVITY_STATE = WAIT_FOR_SIPI so the guest OS
-     * sees it exactly as hardware would. Leaving it ACTIVE for now
-     * means the stub just runs its halt until the OS issues INIT -
-     * which still exits to us and lets the INIT/SIPI handlers do the
-     * right thing from there. */
+    /* Override the guest CS/RIP: this AP's non-root execution would
+     * start in the tiny halt stub at AP_GUEST_STUB_ADDR if it ever ran
+     * from entry, but with GUEST_ACTIVITY_STATE = WAIT_FOR_SIPI below
+     * the guest is suspended until Windows's INIT-SIPI arrives. The
+     * stub is still the safety net: if we ever mis-handle a SIPI and
+     * the guest runs from this CS:IP anyway, it HLTs instead of
+     * executing uninitialised low memory. */
     writeRealModeSegment(GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR_BYTES,
                          AP_GUEST_STUB_SEGMENT, REAL_MODE_CODE_AR);
     vmwrite(GUEST_RIP, 0);
+
+    /* Phase C: come up in WAIT_FOR_SIPI. Real hardware leaves an AP
+     * suspended after reset until it receives SIPI, and Windows's SMP
+     * bring-up code assumes that - if we launch ACTIVE, the AP runs
+     * guest code before Windows has set up its per-CPU state, and the
+     * INIT that Windows later sends arrives at a running guest instead
+     * of a suspended one (still legal but needlessly different). The
+     * vmexit handler bumps us ACTIVE on SIPI, see src/vmexit.c. */
+    vmwrite(GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_WAIT_FOR_SIPI);
 
     /* VMLAUNCH: never returns on success. bootDrive doesn't matter for
      * an AP guest - DL isn't an MBR entry on this path. */

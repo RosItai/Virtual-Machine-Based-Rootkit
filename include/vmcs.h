@@ -230,6 +230,15 @@
  * GUEST_INTERRUPTIBILITY_INFO. */
 #define INTERRUPTIBILITY_BLOCKING_MASK 0x3ull
 
+/* Values the GUEST_ACTIVITY_STATE field can take (SDM Vol. 3C Table 24-2).
+ * The SIPI handler in vmexit.c walks an AP guest between WAIT_FOR_SIPI
+ * (set on INIT) and ACTIVE (set on SIPI, with CS:IP pointing at the SIPI
+ * vector), mirroring what real hardware does to logical processors. */
+#define GUEST_ACTIVITY_ACTIVE         0u
+#define GUEST_ACTIVITY_HLT            1u
+#define GUEST_ACTIVITY_SHUTDOWN       2u
+#define GUEST_ACTIVITY_WAIT_FOR_SIPI  3u
+
 /* --- How every VMX instruction reports failure ---
  * CF=1 (VMfailInvalid) or ZF=1 (VMfailValid) means failure, both clear
  * means success. */
