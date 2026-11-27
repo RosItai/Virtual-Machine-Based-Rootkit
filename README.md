@@ -4,7 +4,7 @@
   \ \ / /| |\/| |  _ \| |_) |
    \ V / | |  | | |_) |  _ <
     \_/  |_|  |_|____/|_| \_\
-                      by: Itai Rosenperl
+     by: Itai Rosenperl
 ```
 
 # Bare-Metal Hypervisor Rootkit
