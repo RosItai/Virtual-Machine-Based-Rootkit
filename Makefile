@@ -2,7 +2,11 @@
 # C Compiler
 # ----------------------------------------------------------------------
 CC = gcc
-CFLAGS = -c -nostdlib -fno-builtin -fno-stack-protector -m64 -mno-red-zone -mcmodel=large -ffreestanding -fno-pic -g -I./include
+# EXTRA_CFLAGS is how the interactive run-win10 target threads -D
+# toggles like DEBUG_INT13=1 and DEBUG_PORT_IO=1 into the compile without
+# changing the committed defaults. Normal builds leave it empty.
+EXTRA_CFLAGS ?=
+CFLAGS = -c -nostdlib -fno-builtin -fno-stack-protector -m64 -mno-red-zone -mcmodel=large -ffreestanding -fno-pic -g -I./include $(EXTRA_CFLAGS)
 # -c:                Compile source files into object files without linking.
 # -nostdlib:         Do not link against standard libraries.
 # -fno-builtin:      Do not treat standard functions as built-in, preventing compiler optimizations for them.
@@ -109,11 +113,40 @@ SMP      ?= 1
 # count). Keeps the long `DISK_IMG=... DISK_FMT=qcow2 MEM=8G` form out of
 # day-to-day use.
 WIN10_IMG ?= $(abspath Win10/win10.qcow2)
+
+# Four explicit targets, picked by how chatty you want the serial log:
+#   run-win10        /  run-win10-gui      - silent: no INT 13h, no port I/O
+#   run-win10-log    /  run-win10-gui-log  - verbose: both logs on
+# SIPI/INIT lines, guest-hook installation lines, EPT hiding, VMCS init
+# and every error/fatal message print in all four - DEBUG_INT13 /
+# DEBUG_PORT_IO control only the two bulk categories that eclipse the
+# rest of the log at Windows boot speed (and that historically burned
+# through the guest's 100ms DPC watchdog). The verbose targets recompile
+# just hooks.o and vmexit.o with -B so toggling takes effect without a
+# full `make clean`.
+WIN10_SMP := $(if $(filter-out 1,$(SMP)),$(SMP),4)
+define RUN_WIN10
+	$(MAKE) -B build/debug.o build/hooks.o build/vmexit.o EXTRA_CFLAGS="$(2)" >/dev/null
+	$(MAKE) $(1) EXTRA_CFLAGS="$(2)" DISK_IMG=$(WIN10_IMG) DISK_FMT=qcow2 MEM=8G SMP=$(WIN10_SMP)
+endef
+
+# -log adds the per-port, per-INT-13h and the whole progress stream
+# (logInfo / logSection). Without -log, logInfo/logSection are compile-
+# time no-ops - the serial console shows only the big ASCII banner plus
+# any genuine error line.
+WIN10_LOG_FLAGS := -DVERBOSE_LOG=1 -DDEBUG_INT13=1 -DDEBUG_PORT_IO=1
+
 run-win10:
-	$(MAKE) run DISK_IMG=$(WIN10_IMG) DISK_FMT=qcow2 MEM=8G SMP=$(if $(filter-out 1,$(SMP)),$(SMP),4)
+	$(call RUN_WIN10,run,)
 
 run-win10-gui:
-	$(MAKE) run-gui DISK_IMG=$(WIN10_IMG) DISK_FMT=qcow2 MEM=8G SMP=$(if $(filter-out 1,$(SMP)),$(SMP),4)
+	$(call RUN_WIN10,run-gui,)
+
+run-win10-log:
+	$(call RUN_WIN10,run,$(WIN10_LOG_FLAGS))
+
+run-win10-gui-log:
+	$(call RUN_WIN10,run-gui,$(WIN10_LOG_FLAGS))
 
 # Boot the Windows installer ISO against the installed Windows qcow2, NO
 # VMBR in the loop. Lets you reach WinRE "Repair your computer" ->

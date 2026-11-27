@@ -17,6 +17,17 @@
 #include "debug.h"
 #include "disk.h"
 
+/* Off by default - set to 1 to log every guest INT 13h call (ext/CHS
+ * read, or the generic "function X, drive Y" for everything else).
+ * Useful when watching the firmware/boot loader disk path or the
+ * Windows pre-kernel boot. Once the guest kernel owns its own disk
+ * driver these calls stop anyway, but the loader/winload phase can
+ * emit hundreds and the Makefile's `run-win10` asks before enabling
+ * them so the log stays readable by default. */
+#ifndef DEBUG_INT13
+#define DEBUG_INT13 0
+#endif
+
 /* The int 15h, E820 protocol. EDX carries this signature both ways; a
  * call without it isn't really an E820 query. */
 #define E820_SIGNATURE 0x534D4150u /* 'SMAP' */
@@ -265,6 +276,7 @@ static void serviceDiskObserve(VmExitContext *ctx) {
     uint8_t function = (uint8_t)(regs->rax >> 8); /* AH */
     uint8_t drive = (uint8_t)regs->rdx;           /* DL */
 
+#if DEBUG_INT13
     if (function == INT13_FN_EXT_READ) {
         /* DS:SI points at the Disk Address Packet (guest-physical, which
          * the identity EPT/host paging map 1:1, so it's a usable ptr). */
@@ -278,6 +290,11 @@ static void serviceDiskObserve(VmExitContext *ctx) {
     } else {
         logInfo("guest INT 13h: function 0x%x, drive 0x%x\n", function, drive);
     }
+#else
+    (void)function;
+    (void)drive;
+    (void)regs;
+#endif
 }
 
 int handleHypercall(VmExitContext *ctx) {

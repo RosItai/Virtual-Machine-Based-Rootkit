@@ -22,6 +22,18 @@
 #include "debug.h"
 #include "colors.h"
 
+/* VERBOSE_LOG gates the progress stream: logInfo and logSection drop to
+ * no-ops when it's off so a release / demo run sees only the big ASCII
+ * banner (printed via serial_print in kernel.c, not logInfo) plus any
+ * actual error line. logError ALWAYS prints, because a silent BSOD or
+ * triple-fault with no clue is the worst possible outcome. The guard
+ * sits inside the public functions themselves, so flipping it just
+ * rebuilds debug.o, not every .c file that calls logInfo. The Makefile's
+ * -log targets flip it to 1 via EXTRA_CFLAGS. */
+#ifndef VERBOSE_LOG
+#define VERBOSE_LOG 0
+#endif
+
 /* Serial port is one global device, and once APs started calling logInfo
  * concurrently with the BSP (SMP bring-up in apBringUp) their messages
  * interleaved mid-line into garbage. One spinlock around each public
@@ -145,6 +157,10 @@ void printf(const char *fmt, ...) {
 }
 
 void logInfo(const char *fmt, ...) {
+#if !VERBOSE_LOG
+    (void)fmt;
+    return;
+#else
     va_list args;
     va_start(args, fmt);
     acquireLog();
@@ -152,9 +168,14 @@ void logInfo(const char *fmt, ...) {
     vprintf_impl(fmt, args);
     releaseLog();
     va_end(args);
+#endif
 }
 
 void logSection(const char *fmt, ...) {
+#if !VERBOSE_LOG
+    (void)fmt;
+    return;
+#else
     va_list args;
     va_start(args, fmt);
     acquireLog();
@@ -163,6 +184,7 @@ void logSection(const char *fmt, ...) {
     serial_print(" ==" COLOR_RESET "\n");
     releaseLog();
     va_end(args);
+#endif
 }
 
 void logError(const char *fmt, ...) {

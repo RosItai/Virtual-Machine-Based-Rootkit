@@ -27,6 +27,15 @@
 #include "debug.h"
 #include "hooks.h"
 
+/* Off by default - set to 1 to log every port IN/OUT that passes through
+ * the IO-instruction handler. Useful when hunting a specific device's
+ * behaviour, but under nested KVM every I/O exits here (the inner I/O
+ * bitmap isn't honoured) and Windows's driver traffic is heavy enough
+ * that a logInfo per exit trips the guest's DPC watchdog. */
+#ifndef DEBUG_PORT_IO
+#define DEBUG_PORT_IO 0
+#endif
+
 /* ===================================================================
  * Guest register access
  * =================================================================== */
@@ -421,31 +430,52 @@ static void handleIoInstruction(VmExitContext *ctx) {
             return;
         }
 
-        /* Non-reset write to an intercepted port - pass through. The
-         * 4-byte OUT at 0xCF8 (PCI config address) is the overwhelming
-         * majority of this once a guest OS enumerates PCI, so skip
-         * logging it to keep the serial log readable; the write still
-         * passes through, just quietly. */
-        if (!(port == 0xCF8 && bytes == 4)) {
-            logInfo("guest OUT port=0x%x val=0x%x (%uB) - passing through\n",
-                    port, val, bytes);
-        }
+        /* Non-reset write to an intercepted port - pass through quietly.
+         * Logging every port I/O was fine when only the three reset ports
+         * showed up here, but under nested KVM every I/O instruction
+         * exits whatever our bitmap says. Windows's IDE/serial drivers
+         * do thousands of single-byte port ops per second during boot,
+         * and a logInfo per exit (lock + format + ~100us at 115200 baud)
+         * burned through the 100ms DPC watchdog budget - same bugcheck
+         * the first REP-INS emulator produced. Guard the chatter behind
+         * DEBUG_PORT_IO so it can come back on demand. */
         switch (bytes) {
         case 1: __asm__ volatile("outb %b0, %w1" : : "a"((uint8_t) val), "Nd"(port)); break;
         case 2: __asm__ volatile("outw %w0, %w1" : : "a"((uint16_t)val), "Nd"(port)); break;
         case 4: __asm__ volatile("outl %k0, %w1" : : "a"((uint32_t)val), "Nd"(port)); break;
         }
+#if DEBUG_PORT_IO
+        if (!(port == 0xCF8 && bytes == 4)) {
+            logInfo("guest OUT port=0x%x val=0x%x (%uB) - passing through\n",
+                    port, val, bytes);
+        }
+#endif
     } else {
-        /* IN: pass through and hand the result back to the guest. */
+        /* IN: pass through and hand the result back to the guest. Per
+         * Intel SDM, `in AL, dx` modifies only AL (RAX bits 63:8 are
+         * preserved); `in AX, dx` modifies only AX (bits 63:16 preserved);
+         * only `in EAX, dx` zero-extends per x86-64's rule for 32-bit
+         * destinations (bits 63:32 cleared). An earlier version assigned
+         * the plain result to the whole RAX register, which silently
+         * wiped every high-order bit the guest had in RAX before the IN -
+         * including kernel pointers or counts a routine happened to be
+         * carrying across the instruction. Later use of that register
+         * corrupted the guest's data structures and surfaced hours later
+         * as `KERNEL_MODE_HEAP_CORRUPTION`. */
         uint32_t val = 0;
         switch (bytes) {
         case 1: { uint8_t  b; __asm__ volatile("inb %w1, %b0" : "=a"(b) : "Nd"(port)); val = b; } break;
         case 2: { uint16_t w; __asm__ volatile("inw %w1, %w0" : "=a"(w) : "Nd"(port)); val = w; } break;
         case 4: { uint32_t d; __asm__ volatile("inl %w1, %k0" : "=a"(d) : "Nd"(port)); val = d; } break;
         }
-        /* IN zeroes the upper bits: byte IN clears bits 31:8, etc. */
-        ctx->registers->rax = val;
-        logInfo("guest IN  port=0x%x → 0x%x (%uB)\n", port, val, bytes);
+        switch (bytes) {
+        case 1: ctx->registers->rax = (ctx->registers->rax & ~0xFFULL)   | (uint64_t)(uint8_t)val;  break;
+        case 2: ctx->registers->rax = (ctx->registers->rax & ~0xFFFFULL) | (uint64_t)(uint16_t)val; break;
+        case 4: ctx->registers->rax = (uint64_t)(uint32_t)val; break;
+        }
+#if DEBUG_PORT_IO
+        logInfo("guest IN  port=0x%x -> 0x%x (%uB)\n", port, val, bytes);
+#endif
     }
 
     advanceGuestRip(ctx);
